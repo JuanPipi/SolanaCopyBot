@@ -1,0 +1,32 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# State and logs (contain sensitive transaction data)
+state.json
+signals.csv
+decisions.csv
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (if any)
+node_modules/
+
+# Backup files
+*.bak
+*.backup
