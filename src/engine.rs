@@ -193,7 +193,7 @@ impl DecisionEngine {
 
     pub fn handle_signal(&mut self, s: TradeSignal) -> Vec<Action> {
         // 0) Filtrar señales viejas
-        if s.ts <= self.state.last_processed_ts {
+        if s.ts < self.state.last_processed_ts {
             let reason = format!(
                 "Señal vieja (ts={} <= last={}) -> SKIP | mint={} sig={}",
                 s.ts, self.state.last_processed_ts, s.mint, &s.sig[..8.min(s.sig.len())]
