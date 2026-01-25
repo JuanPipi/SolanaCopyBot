@@ -71,16 +71,21 @@ async fn main() -> anyhow::Result<()> {
     let exec_config = ExecutorConfig {
         rpc_url: cfg.helius_http.clone(),
         dry_run: true, // IMPORTANTE: cambiar a false para ejecución real
-        jito_enabled: false,
-        jito_url: None,
-        jito_tip_lamports: 10_000,
+        jito_enabled: cfg.jito_enabled(),
+        jito_url: cfg.jito_url.clone(),
+        jito_auth: cfg.jito_auth.clone(),
+        jito_tip_lamports: cfg.jito_tip_lamports,
         compute_units: 200_000,
         priority_fee_micro_lamports: 1_000,
+        keypair_path: cfg.keypair_path.clone(),
     };
 
     println!("🎮 Executor Config:");
     println!("   - dry_run: {} (NO ejecuta trades reales)", exec_config.dry_run);
     println!("   - jito_enabled: {}", exec_config.jito_enabled);
+    if exec_config.jito_enabled {
+        println!("   - jito_tip: {} lamports", exec_config.jito_tip_lamports);
+    }
     println!("   - compute_units: {}", exec_config.compute_units);
     println!("   - priority_fee: {} micro-lamports/CU", exec_config.priority_fee_micro_lamports);
     println!("═══════════════════════════════════════════════════════");

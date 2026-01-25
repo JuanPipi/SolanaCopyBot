@@ -8,6 +8,11 @@ Cargo.lock
 .env.*
 !.env.example
 
+# Keypairs (CRITICAL - never commit!)
+*-keypair.json
+*.keypair.json
+id.json
+
 # State and logs (contain sensitive transaction data)
 state.json
 signals.csv

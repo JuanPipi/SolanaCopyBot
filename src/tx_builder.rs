@@ -9,6 +9,7 @@ use solana_sdk::{
     message::Message,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
+    system_instruction,
     transaction::Transaction,
 };
 
@@ -91,6 +92,54 @@ impl TxBuilder {
         // Base fee (5000 lamports) + priority fee
         let priority_fee = (self.config.compute_units as u64 * self.config.priority_fee_micro_lamports) / 1_000_000;
         5_000 + priority_fee
+    }
+
+    /// Construye una transacción de tip para Jito bundles
+    /// El tip va a una de las tip accounts de Jito
+    pub fn build_tip_tx(
+        &self,
+        payer: &Keypair,
+        recent_blockhash: Hash,
+        tip_account: &Pubkey,
+        tip_lamports: u64,
+    ) -> Result<Transaction> {
+        // Compute budget (opcional pero no daña)
+        let mut ixs = self.compute_budget_ixs();
+        
+        // Transfer del tip a la cuenta de Jito
+        ixs.push(system_instruction::transfer(
+            &payer.pubkey(),
+            tip_account,
+            tip_lamports,
+        ));
+
+        let message = Message::new(&ixs, Some(&payer.pubkey()));
+        let mut tx = Transaction::new_unsigned(message);
+        tx.sign(&[payer], recent_blockhash);
+        
+        Ok(tx)
+    }
+
+    /// Construye una transacción dummy (solo transfer pequeño) para test de bundles
+    pub fn build_dummy_tx(
+        &self,
+        payer: &Keypair,
+        recent_blockhash: Hash,
+    ) -> Result<Transaction> {
+        let mut ixs = self.compute_budget_ixs();
+        
+        // Self-transfer de 0 lamports (válido pero no hace nada)
+        ixs.push(system_instruction::transfer(
+            &payer.pubkey(),
+            &payer.pubkey(),
+            0,
+        ));
+
+        let message = Message::new(&ixs, Some(&payer.pubkey()));
+        let mut tx = Transaction::new_unsigned(message);
+        tx.sign(&[payer], recent_blockhash);
+        
+        Ok(tx)
     }
 }
 
