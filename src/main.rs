@@ -12,11 +12,15 @@ mod executor;
 
 use config::Config;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::read_keypair_file;
 use tokio::sync::mpsc;
 use crate::decoder::analyze_transaction_async;
 use crate::engine::{Action, DecisionEngine, RiskConfig};
 use crate::csv_logger::CsvLogger;
 use crate::executor::{Executor, ExecutorConfig};
+use crate::broadcaster::{BroadcastConfig, Broadcaster};
+use crate::tx_builder::{TxBuilder, TxBuilderConfig};
 use tokio::time::{sleep, Duration};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,6 +29,14 @@ use tokio::sync::Mutex;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg = Config::load();
+
+    // Check for --test-jito flag
+    let args: Vec<String> = std::env::args().collect();
+    let test_jito = args.iter().any(|a| a == "--test-jito");
+
+    if test_jito {
+        return run_jito_test(&cfg).await;
+    }
 
     println!("🚀 Bot iniciado");
     println!("═══════════════════════════════════════════════════════");
@@ -183,6 +195,97 @@ async fn main() -> anyhow::Result<()> {
         txq,
     )
     .await?;
+
+    Ok(())
+}
+
+/// Test Jito bundle pipeline without real swaps
+async fn run_jito_test(cfg: &Config) -> anyhow::Result<()> {
+    println!("═══════════════════════════════════════════════════════");
+    println!("🧪 TEST JITO BUNDLE");
+    println!("═══════════════════════════════════════════════════════");
+
+    // 1. Check config
+    let keypair_path = cfg.keypair_path.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("KEYPAIR_PATH not set in .env"))?;
+    
+    let jito_url = cfg.jito_url.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("JITO_URL not set in .env"))?;
+
+    println!("📁 Keypair: {}", keypair_path);
+    println!("🌐 Jito URL: {}", jito_url);
+    println!("💰 Tip: {} lamports", cfg.jito_tip_lamports);
+
+    // 2. Load keypair
+    let payer = read_keypair_file(keypair_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load keypair: {}", e))?;
+    
+    use solana_sdk::signer::Signer;
+    println!("🔑 Bot pubkey: {}", payer.pubkey());
+
+    // 3. Create broadcaster
+    let broadcaster = Broadcaster::new(BroadcastConfig {
+        jito_enabled: true,
+        jito_tip_lamports: cfg.jito_tip_lamports,
+        rpc_url: cfg.helius_http.clone(),
+        jito_url: Some(jito_url.clone()),
+        jito_auth: cfg.jito_auth.clone(),
+    });
+
+    // 4. Create tx builder
+    let tx_builder = TxBuilder::new(TxBuilderConfig::default());
+
+    // 5. Get RPC client for blockhash
+    let rpc_client = RpcClient::new(cfg.helius_http.clone());
+
+    // 6. Check balance
+    let balance = rpc_client.get_balance(&payer.pubkey()).await?;
+    let balance_sol = balance as f64 / 1_000_000_000.0;
+    println!("💵 Balance: {} SOL ({} lamports)", balance_sol, balance);
+
+    if balance < 50_000 {
+        return Err(anyhow::anyhow!("Insufficient balance! Need at least 50,000 lamports for test"));
+    }
+
+    // 7. Get tip account from Jito
+    println!("\n📡 Fetching tip accounts from Jito...");
+    let tip_account_str = broadcaster.pick_tip_account().await?;
+    let tip_pubkey: Pubkey = tip_account_str.parse()?;
+    println!("✅ Tip account: {}", tip_pubkey);
+
+    // 8. Get recent blockhash
+    println!("\n📡 Getting recent blockhash...");
+    let blockhash = tx_builder.get_recent_blockhash(&rpc_client).await?;
+    println!("✅ Blockhash: {}", blockhash);
+
+    // 9. Build transactions
+    println!("\n🔧 Building transactions...");
+    
+    // Dummy tx: self-transfer of 1 lamport (valid but does nothing)
+    let dummy_tx = tx_builder.build_self_transfer_tx(&payer, blockhash)?;
+    println!("✅ Dummy TX built (self-transfer 1 lamport)");
+
+    // Tip tx: transfer to Jito tip account
+    let tip_tx = tx_builder.build_tip_tx(&payer, blockhash, &tip_pubkey, cfg.jito_tip_lamports)?;
+    println!("✅ Tip TX built ({} lamports to {})", cfg.jito_tip_lamports, &tip_account_str[..8]);
+
+    // 10. Send bundle!
+    println!("\n📦 Sending bundle to Jito...");
+    let bundle_id = broadcaster.send_bundle_base64(&[dummy_tx, tip_tx]).await?;
+    println!("✅ Bundle sent! ID: {}", bundle_id);
+
+    // 11. Check status (optional)
+    println!("\n📊 Checking bundle status...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    
+    let status = broadcaster.get_bundle_statuses(&[bundle_id.clone()]).await?;
+    println!("📦 Bundle status: {}", serde_json::to_string_pretty(&status)?);
+
+    println!("\n═══════════════════════════════════════════════════════");
+    println!("🎉 JITO TEST COMPLETE!");
+    println!("═══════════════════════════════════════════════════════");
+    println!("\nIf bundle status shows 'Landed', your pipeline is working!");
+    println!("You can now switch to real swaps by setting dry_run: false");
 
     Ok(())
 }

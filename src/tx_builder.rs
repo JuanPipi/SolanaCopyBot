@@ -141,6 +141,27 @@ impl TxBuilder {
         
         Ok(tx)
     }
+
+    /// Construye una transacción de self-transfer (1 lamport) para test de bundles
+    /// Más "real" que 0 lamports, útil para verificar que el pipeline funciona
+    pub fn build_self_transfer_tx(
+        &self,
+        payer: &Keypair,
+        recent_blockhash: Hash,
+    ) -> Result<Transaction> {
+        // Self-transfer de 1 lamport (tx válida y casi gratis)
+        let ix = system_instruction::transfer(
+            &payer.pubkey(),
+            &payer.pubkey(),
+            1, // 1 lamport
+        );
+
+        let message = Message::new(&[ix], Some(&payer.pubkey()));
+        let mut tx = Transaction::new_unsigned(message);
+        tx.sign(&[payer], recent_blockhash);
+        
+        Ok(tx)
+    }
 }
 
 /// Helper para crear instrucciones de swap (placeholder)
