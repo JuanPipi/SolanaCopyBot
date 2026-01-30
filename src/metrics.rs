@@ -16,6 +16,7 @@ pub struct MetricsTracker {
     detect_done: Option<Instant>,
     build_done: Option<Instant>,
     send_done: Option<Instant>,
+    confirm_done: Option<Instant>,
 }
 
 impl MetricsTracker {
@@ -25,6 +26,7 @@ impl MetricsTracker {
             detect_done: None,
             build_done: None,
             send_done: None,
+            confirm_done: None,
         }
     }
 
@@ -40,8 +42,12 @@ impl MetricsTracker {
         self.send_done = Some(Instant::now());
     }
 
+    pub fn mark_confirm_done(&mut self) {
+        self.confirm_done = Some(Instant::now());
+    }
+
     pub fn finalize(self, success: bool, error: Option<String>) -> TxMetrics {
-        let now = Instant::now();
+        let end = self.confirm_done.unwrap_or_else(Instant::now);
 
         let t_detect_ms = self
             .detect_done
@@ -58,12 +64,12 @@ impl MetricsTracker {
             _ => 0,
         };
 
-        let t_confirm_ms = self
-            .send_done
-            .map(|s| now.duration_since(s).as_millis() as u64)
-            .unwrap_or(0);
+        let t_confirm_ms = match (self.send_done, self.confirm_done) {
+            (Some(s), Some(c)) => c.duration_since(s).as_millis() as u64,
+            _ => 0,
+        };
 
-        let total_ms = now.duration_since(self.start).as_millis() as u64;
+        let total_ms = end.duration_since(self.start).as_millis() as u64;
 
         TxMetrics {
             t_detect_ms,

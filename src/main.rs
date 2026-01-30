@@ -9,6 +9,7 @@ mod broadcaster;
 mod prepared;
 mod tx_builder;
 mod executor;
+mod jupiter;
 
 use config::Config;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -45,22 +46,20 @@ async fn main() -> anyhow::Result<()> {
     let (txq, mut rxq) = mpsc::channel::<(String, String)>(200);
 
     // Risk config con SIZING DINÁMICO
-    // Con 1 SOL de capital:
-    // - Trades entre 0.02 y 0.10 SOL según convicción del líder
-    // - k=0.035 significa: si líder mete 2 SOL -> yo meto 0.07 SOL
-    // - Exposure cap 0.35 SOL -> puedo tener 3-5 posiciones chicas
-    // - Reserve 0.20 SOL -> nunca me quedo sin gas
+    // MODO TEST SEGURO: trades chicos para validar pipeline
+    // - max 0.01 SOL por trade
+    // - exposure cap bajo
     let risk = RiskConfig {
-        // Sizing dinámico
-        min_trade_sol: 0.02,         // mínimo por trade
-        max_trade_sol: 0.10,         // máximo por trade
-        k_leader_scale: 0.035,       // my_trade = k * abs(leader_delta)
+        // Sizing dinámico - MODO TEST
+        min_trade_sol: 0.005,        // mínimo por trade (test)
+        max_trade_sol: 0.01,         // máximo por trade (test)
+        k_leader_scale: 0.005,       // my_trade = k * abs(leader_delta)
         
         // Quality Gate
-        min_leader_sol_delta: 0.15,  // filtrar micro-ruido del líder
-        exposure_cap_sol: 0.35,      // máximo total expuesto
-        reserve_sol: 0.20,           // colchón intocable (fees + margen)
-        total_capital_sol: 1.0,      // mi capital total
+        min_leader_sol_delta: 0.10,  // filtrar micro-ruido del líder
+        exposure_cap_sol: 0.15,      // máximo total expuesto
+        reserve_sol: 0.05,           // colchón intocable (fees + margen)
+        total_capital_sol: 0.25,     // mi capital total
         
         // Rate limits y timing
         min_buy_interval_secs: 15,   // evitar spam
@@ -79,10 +78,10 @@ async fn main() -> anyhow::Result<()> {
     println!("   - cooldown: {}s | max_hold: {}h", risk.cooldown_secs, risk.max_hold_secs / 3600);
     println!("═══════════════════════════════════════════════════════");
 
-    // Executor config (dry_run por defecto)
+    // Executor config (ejecución REAL activada)
     let exec_config = ExecutorConfig {
         rpc_url: cfg.helius_http.clone(),
-        dry_run: true, // IMPORTANTE: cambiar a false para ejecución real
+        dry_run: false, // EJECUCIÓN REAL ACTIVADA
         jito_enabled: cfg.jito_enabled(),
         jito_url: cfg.jito_url.clone(),
         jito_auth: cfg.jito_auth.clone(),
@@ -90,16 +89,18 @@ async fn main() -> anyhow::Result<()> {
         compute_units: 200_000,
         priority_fee_micro_lamports: 1_000,
         keypair_path: cfg.keypair_path.clone(),
+        jupiter_api_key: cfg.jupiter_api_key.clone(),
+        slippage_bps: 300, // 3% slippage (pump tokens volatiles)
     };
 
     println!("🎮 Executor Config:");
-    println!("   - dry_run: {} (NO ejecuta trades reales)", exec_config.dry_run);
+    println!("   - dry_run: {} {}", exec_config.dry_run, if exec_config.dry_run { "(simulación)" } else { "(REAL!)" });
     println!("   - jito_enabled: {}", exec_config.jito_enabled);
     if exec_config.jito_enabled {
         println!("   - jito_tip: {} lamports", exec_config.jito_tip_lamports);
     }
-    println!("   - compute_units: {}", exec_config.compute_units);
-    println!("   - priority_fee: {} micro-lamports/CU", exec_config.priority_fee_micro_lamports);
+    println!("   - slippage: {}bps ({}%)", exec_config.slippage_bps, exec_config.slippage_bps as f64 / 100.0);
+    println!("   - jupiter_api: {}", if exec_config.jupiter_api_key.is_some() { "configured" } else { "free tier" });
     println!("═══════════════════════════════════════════════════════");
 
     // RPC Client compartido (evita crear uno nuevo por cada tx)
@@ -165,13 +166,69 @@ async fn main() -> anyhow::Result<()> {
                             logger.log_decision(signal_ref, &action);
                         }
 
-                        // Executor (Build -> Broadcast -> Confirm)
-                        match &action {
-                            Action::Buy { .. } | Action::Sell { .. } => {
-                                if let Err(e) = executor.execute(action).await {
-                                    eprintln!("⚠️ Error ejecutando: {}", e);
+                        // Ejecutar acción con el nuevo ciclo de vida
+                        match action {
+                            Action::Buy { mint, sol_amount, leader_delta: _, leader_sig: _ } => {
+                                // pending_buy ya fue agregado por el engine
+                                match executor.execute_buy(&mint, sol_amount).await {
+                                    Ok(result) => {
+                                        // ÉXITO: confirmar posición con MI signature
+                                        engine.confirm_position(
+                                            &mint,
+                                            &result.my_sig,
+                                            result.my_token_balance,
+                                            result.my_sol_spent,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // FALLO: cancelar pending
+                                        engine.cancel_pending_buy(&mint, &e.to_string());
+                                    }
                                 }
                             }
+                            
+                            Action::Sell { mint, reason } => {
+                                match executor.execute_sell(&mint, &reason).await {
+                                    Ok(_result) => {
+                                        // ÉXITO: remover posición
+                                        engine.remove_position(&mint);
+                                    }
+                                    Err(e) => {
+                                        // FALLO: mantener posición, loguear error
+                                        eprintln!("⚠️ [MAIN] SELL failed for {}: {}", &mint[..8.min(mint.len())], e);
+                                    }
+                                }
+                            }
+                            
+                            Action::WaitAndSell { mint, wait_ms, max_retries } => {
+                                // SELL llegó pero BUY está pending - esperar y reintentar
+                                for attempt in 0..max_retries {
+                                    println!("⏳ [WAIT] SELL attempt {}/{} for {} - waiting {}ms", 
+                                             attempt + 1, max_retries, &mint[..8.min(mint.len())], wait_ms);
+                                    sleep(Duration::from_millis(wait_ms)).await;
+                                    
+                                    // Re-check si ahora hay posición abierta
+                                    if engine.state.open_positions.contains_key(&mint) {
+                                        match executor.execute_sell(&mint, "leader_sell_delayed").await {
+                                            Ok(_) => {
+                                                engine.remove_position(&mint);
+                                                println!("✅ [WAIT] SELL delayed exitoso para {}", &mint[..8.min(mint.len())]);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("⚠️ [WAIT] SELL delayed failed: {}", e);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    
+                                    // Si ya no hay pending ni position, salir
+                                    if !engine.has_pending_buy(&mint) && !engine.state.open_positions.contains_key(&mint) {
+                                        println!("ℹ️ [WAIT] No pending ni position para {} - skip", &mint[..8.min(mint.len())]);
+                                        break;
+                                    }
+                                }
+                            }
+                            
                             Action::Skip { .. } => {
                                 // Ya se logueó en el engine
                             }
@@ -269,23 +326,41 @@ async fn run_jito_test(cfg: &Config) -> anyhow::Result<()> {
     let tip_tx = tx_builder.build_tip_tx(&payer, blockhash, &tip_pubkey, cfg.jito_tip_lamports)?;
     println!("✅ Tip TX built ({} lamports to {})", cfg.jito_tip_lamports, &tip_account_str[..8]);
 
-    // 10. Send bundle!
-    println!("\n📦 Sending bundle to Jito...");
+    // 10. Send bundle ONCE!
+    println!("\n📦 Sending bundle to Jito (ONE TIME ONLY)...");
+    let t_send_start = std::time::Instant::now();
     let bundle_id = broadcaster.send_bundle_base64(&[dummy_tx, tip_tx]).await?;
+    let send_ms = t_send_start.elapsed().as_millis() as u64;
     println!("✅ Bundle sent! ID: {}", bundle_id);
+    println!("   └─ send_ms: {}ms", send_ms);
 
-    // 11. Check status (optional)
-    println!("\n📊 Checking bundle status...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    
-    let status = broadcaster.get_bundle_statuses(&[bundle_id.clone()]).await?;
-    println!("📦 Bundle status: {}", serde_json::to_string_pretty(&status)?);
+    // 11. Poll status with backoff (NO RE-SEND!)
+    println!("\n📊 Polling bundle status (backoff: 500ms->1s->2s->4s, timeout: 30s)...");
+    let (landed, status_str, land_ms) = broadcaster.poll_bundle_until_landed(&bundle_id, 30_000).await;
 
     println!("\n═══════════════════════════════════════════════════════");
-    println!("🎉 JITO TEST COMPLETE!");
+    if landed {
+        println!("🎉 BUNDLE LANDED!");
+        println!("   └─ status: {}", status_str);
+        println!("   └─ land_ms: {}ms (time from send to confirmed)", land_ms);
+        println!("   └─ total pipeline: send={}ms + land={}ms = {}ms", send_ms, land_ms, send_ms + land_ms);
+    } else {
+        println!("⚠️ BUNDLE DID NOT LAND (may still be processing)");
+        println!("   └─ last status: {}", status_str);
+        println!("   └─ This could be: rate limit, dropped, or slow confirmation");
+        println!("\n💡 Check manually:");
+        println!("   https://explorer.jito.wtf/bundle/{}", bundle_id);
+    }
     println!("═══════════════════════════════════════════════════════");
-    println!("\nIf bundle status shows 'Landed', your pipeline is working!");
-    println!("You can now switch to real swaps by setting dry_run: false");
+
+    println!("\n📊 METRICS SUMMARY:");
+    println!("   ├─ send_ms: {}ms (time to submit to Jito)", send_ms);
+    println!("   ├─ land_ms: {}ms (time until confirmed)", land_ms);
+    println!("   └─ total: {}ms", send_ms + land_ms);
+    
+    if landed {
+        println!("\n✅ Pipeline verificado. Podés usar el bot con confianza.");
+    }
 
     Ok(())
 }

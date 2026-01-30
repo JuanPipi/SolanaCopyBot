@@ -86,11 +86,14 @@ impl CsvLogger {
         let sig_hash = s.map(|sig| sig.sig.as_str()).unwrap_or("-");
 
         let (action_str, reason, mint_used) = match action {
-            Action::Buy { mint, sol_amount, reason } => {
-                ("COPY_BUY".to_string(), format!("sol={} {}", sol_amount, reason), mint.as_str())
+            Action::Buy { mint, sol_amount, leader_delta, .. } => {
+                ("COPY_BUY".to_string(), format!("sol={:.4} leader_delta={:.4}", sol_amount, leader_delta), mint.as_str())
             }
             Action::Sell { mint, reason } => {
                 ("COPY_SELL".to_string(), reason.clone(), mint.as_str())
+            }
+            Action::WaitAndSell { mint, wait_ms, max_retries } => {
+                ("WAIT_SELL".to_string(), format!("wait={}ms retries={}", wait_ms, max_retries), mint.as_str())
             }
             Action::Skip { reason } => {
                 ("SKIP".to_string(), reason.clone(), mint_from_signal)

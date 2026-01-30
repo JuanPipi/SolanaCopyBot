@@ -151,6 +151,91 @@ impl Broadcaster {
         Ok(v)
     }
 
+    /// Poll bundle status con backoff exponencial hasta "Landed" o timeout
+    /// Retorna: (landed: bool, status_str: String, elapsed_ms: u64)
+    pub async fn poll_bundle_until_landed(
+        &self,
+        bundle_id: &str,
+        timeout_ms: u64,
+    ) -> (bool, String, u64) {
+        use std::time::Instant;
+        use tokio::time::{sleep, Duration};
+
+        let start = Instant::now();
+        let mut delay_ms: u64 = 500; // Start at 500ms
+        let max_delay_ms: u64 = 4000; // Cap at 4s
+        let mut last_status = "unknown".to_string();
+        let mut attempts = 0;
+
+        loop {
+            let elapsed = start.elapsed().as_millis() as u64;
+            
+            // Timeout check
+            if elapsed >= timeout_ms {
+                return (false, format!("timeout after {}ms (last: {})", elapsed, last_status), elapsed);
+            }
+
+            attempts += 1;
+            
+            // Poll status (NO re-send!)
+            match self.get_bundle_statuses(&[bundle_id.to_string()]).await {
+                Ok(v) => {
+                    // Check for rate limit error
+                    if let Some(err) = v.get("error") {
+                        let err_str = err.to_string();
+                        if err_str.contains("rate limited") || err_str.contains("-32097") {
+                            // Rate limited - backoff silently
+                            last_status = "rate_limited".to_string();
+                        } else {
+                            last_status = format!("error: {}", err_str);
+                        }
+                    } else if let Some(result) = v.get("result") {
+                        // Parse the status from result
+                        if let Some(value) = result.get("value") {
+                            if let Some(arr) = value.as_array() {
+                                if let Some(first) = arr.first() {
+                                    if let Some(status) = first.get("confirmation_status").and_then(|s| s.as_str()) {
+                                        last_status = status.to_string();
+                                        
+                                        // Check if landed
+                                        if status == "confirmed" || status == "finalized" {
+                                            let land_ms = start.elapsed().as_millis() as u64;
+                                            return (true, status.to_string(), land_ms);
+                                        }
+                                    }
+                                    // Also check for "Landed" in different formats
+                                    if let Some(status) = first.get("status").and_then(|s| s.as_str()) {
+                                        last_status = status.to_string();
+                                        if status.to_lowercase().contains("landed") || status.to_lowercase().contains("confirmed") {
+                                            let land_ms = start.elapsed().as_millis() as u64;
+                                            return (true, status.to_string(), land_ms);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // If result exists but no clear status, check if it's empty (still processing)
+                        if result.get("value").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
+                            last_status = "processing".to_string();
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_status = format!("poll_error: {}", e);
+                }
+            }
+
+            // Log progress every few attempts
+            if attempts % 3 == 0 {
+                println!("   ⏳ Poll #{} | status={} | elapsed={}ms", attempts, last_status, elapsed);
+            }
+
+            // Backoff exponencial
+            sleep(Duration::from_millis(delay_ms)).await;
+            delay_ms = std::cmp::min(delay_ms * 2, max_delay_ms);
+        }
+    }
+
     /// RPC fallback
     pub async fn send_via_rpc(&self, tx: &Transaction) -> Result<Signature> {
         let sig = self.rpc_client.send_transaction(tx).await

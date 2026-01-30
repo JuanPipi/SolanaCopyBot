@@ -10,6 +10,8 @@ pub struct Config {
     pub jito_auth: Option<String>,
     // Keypair path for real execution
     pub keypair_path: Option<String>,
+    // Jupiter API (optional, increases rate limits)
+    pub jupiter_api_key: Option<String>,
 }
 
 impl Config {
@@ -42,12 +44,20 @@ impl Config {
         // Keypair path (optional, for real execution)
         let keypair_path = env::var("KEYPAIR_PATH").ok().filter(|s| !s.is_empty());
 
+        // Jupiter API key (optional, increases rate limits)
+        let jupiter_api_key = env::var("JUP_API_KEY").ok().filter(|s| !s.is_empty());
+
         println!("📋 Loaded {} wallet(s) to follow", wallets.len());
         if jito_url.is_some() {
             println!("📦 Jito enabled: tip={} lamports", jito_tip_lamports);
         }
         if keypair_path.is_some() {
             println!("🔑 Keypair configured for real execution");
+        }
+        if jupiter_api_key.is_some() {
+            println!("🪐 Jupiter API key configured");
+        } else {
+            println!("🪐 Jupiter API (free tier, rate limited)");
         }
 
         Self {
@@ -58,6 +68,7 @@ impl Config {
             jito_tip_lamports,
             jito_auth,
             keypair_path,
+            jupiter_api_key,
         }
     }
 

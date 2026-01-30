@@ -35,3 +35,6 @@ node_modules/
 # Backup files
 *.bak
 *.backup
+
+# Rust installer (local, do not commit)
+rustup-init.exe

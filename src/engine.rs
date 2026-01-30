@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::signals::{Side, TradeSignal};
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const PENDING_TIMEOUT_SECS: i64 = 45; // Timeout para pending buys
 
 /// Configuración de riesgo con sizing dinámico
 #[derive(Debug, Clone)]
@@ -28,14 +29,27 @@ pub struct RiskConfig {
     pub max_hold_secs: i64,         // max hold antes de SELL forzado (ej 6h)
 }
 
+/// BUY en proceso (antes de confirmar)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingBuy {
+    pub mint: String,
+    pub started_at: i64,
+    pub leader_sig: String,
+    pub intended_sol: f64,
+    pub leader_delta: f64,
+}
+
+/// Posición confirmada (después de verificar balance > 0)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub mint: String,
-    pub opened_sig: String,
+    pub opened_sig: String,       // MI signature, no del líder
     pub opened_ts: i64,
     pub leader_sol_delta_at_open: f64,
     #[serde(default)]
-    pub my_trade_sol: f64,  // tamaño de MI trade (para calcular exposure)
+    pub my_trade_sol: f64,        // SOL que gasté
+    #[serde(default)]
+    pub my_token_balance: u64,    // Tokens que recibí
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +66,9 @@ pub struct CooldownEntry {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct EngineState {
-    pub open_positions: HashMap<String, Position>,
+    #[serde(default)]
+    pub pending_buys: HashMap<String, PendingBuy>,  // BUYs en proceso
+    pub open_positions: HashMap<String, Position>,   // Posiciones confirmadas
     pub orphan_sells: HashMap<String, OrphanSell>,
     pub cooldown_blacklist: HashMap<String, CooldownEntry>,
     #[serde(default)]
@@ -63,8 +79,9 @@ pub struct EngineState {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Buy { mint: String, sol_amount: f64, reason: String },
+    Buy { mint: String, sol_amount: f64, leader_delta: f64, leader_sig: String },
     Sell { mint: String, reason: String },
+    WaitAndSell { mint: String, wait_ms: u64, max_retries: u32 },  // SELL llegó pero hay pending
     Skip { reason: String },
 }
 
@@ -86,8 +103,15 @@ fn compute_my_trade_sol(risk: &RiskConfig, leader_sol_delta: f64) -> f64 {
     clamp(raw, risk.min_trade_sol, risk.max_trade_sol)
 }
 
+/// Exposure total = open_positions + pending_buys
 fn current_exposure_sol(state: &EngineState) -> f64 {
-    state.open_positions.values().map(|p| p.my_trade_sol).sum()
+    let open: f64 = state.open_positions.values().map(|p| p.my_trade_sol).sum();
+    let pending: f64 = state.pending_buys.values().map(|p| p.intended_sol).sum();
+    open + pending
+}
+
+fn now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 // ============ DECISION ENGINE ============
@@ -105,12 +129,12 @@ impl DecisionEngine {
                 let exposure = current_exposure_sol(&s);
                 println!("📂 [ENGINE] Estado cargado desde: {}", abs_path);
                 println!(
-                    "   └─ {} posiciones | exposure={:.4} SOL | {} orphans | {} cooldowns | last_ts={}",
+                    "   └─ {} open | {} pending | exposure={:.4} SOL | {} orphans | {} cooldowns",
                     s.open_positions.len(),
+                    s.pending_buys.len(),
                     exposure,
                     s.orphan_sells.len(),
                     s.cooldown_blacklist.len(),
-                    s.last_processed_ts
                 );
                 s
             }
@@ -135,18 +159,91 @@ impl DecisionEngine {
         serde_json::from_str(&txt).ok()
     }
 
-    fn save_state(&self) {
+    pub fn save_state(&self) {
         if let Ok(txt) = serde_json::to_string_pretty(&self.state) {
             let _ = fs::write(&self.state_path, txt);
         }
     }
 
-    fn cleanup_cooldowns(&mut self, now_ts: i64) {
+    // ============ PENDING BUY MANAGEMENT ============
+
+    /// Agregar pending buy (llamar ANTES de ejecutar)
+    pub fn add_pending_buy(&mut self, mint: &str, intended_sol: f64, leader_sig: &str, leader_delta: f64) {
+        let pending = PendingBuy {
+            mint: mint.to_string(),
+            started_at: now_ts(),
+            leader_sig: leader_sig.to_string(),
+            intended_sol,
+            leader_delta,
+        };
+        self.state.pending_buys.insert(mint.to_string(), pending);
+        self.state.last_buy_ts = now_ts();
+        self.save_state();
+        println!("📝 [ENGINE] Pending BUY agregado | mint={} | sol={:.4}", &mint[..8.min(mint.len())], intended_sol);
+    }
+
+    /// Confirmar posición (llamar SOLO si executor verificó balance > 0)
+    pub fn confirm_position(&mut self, mint: &str, my_sig: &str, my_token_balance: u64, my_sol_spent: f64) {
+        if let Some(pending) = self.state.pending_buys.remove(mint) {
+            let pos = Position {
+                mint: mint.to_string(),
+                opened_sig: my_sig.to_string(),  // MI signature
+                opened_ts: now_ts(),
+                leader_sol_delta_at_open: pending.leader_delta,
+                my_trade_sol: my_sol_spent,
+                my_token_balance,
+            };
+            self.state.open_positions.insert(mint.to_string(), pos);
+            self.save_state();
+            println!(
+                "✅ [ENGINE] Posición CONFIRMADA | mint={} | my_sig={} | tokens={} | sol={:.4}",
+                &mint[..8.min(mint.len())],
+                &my_sig[..12.min(my_sig.len())],
+                my_token_balance,
+                my_sol_spent
+            );
+        } else {
+            println!("⚠️ [ENGINE] confirm_position pero no hay pending para mint={}", &mint[..8.min(mint.len())]);
+        }
+    }
+
+    /// Cancelar pending (si executor falla)
+    pub fn cancel_pending_buy(&mut self, mint: &str, reason: &str) {
+        if self.state.pending_buys.remove(mint).is_some() {
+            // Agregar cooldown corto para no reintentar inmediatamente
+            self.state.cooldown_blacklist.insert(
+                mint.to_string(),
+                CooldownEntry {
+                    reason: format!("pending_failed: {}", reason),
+                    until_ts: now_ts() + 30, // 30s cooldown
+                },
+            );
+            self.save_state();
+            println!("❌ [ENGINE] Pending CANCELADO | mint={} | reason={}", &mint[..8.min(mint.len())], reason);
+        }
+    }
+
+    /// Check si hay pending buy para un mint
+    pub fn has_pending_buy(&self, mint: &str) -> bool {
+        self.state.pending_buys.contains_key(mint)
+    }
+
+    /// Remover posición abierta (después de SELL exitoso)
+    pub fn remove_position(&mut self, mint: &str) {
+        if self.state.open_positions.remove(mint).is_some() {
+            self.save_state();
+            println!("🗑️ [ENGINE] Posición removida | mint={}", &mint[..8.min(mint.len())]);
+        }
+    }
+
+    // ============ HOUSEKEEPING ============
+
+    fn cleanup_cooldowns(&mut self, ts: i64) {
         let expired: Vec<String> = self
             .state
             .cooldown_blacklist
             .iter()
-            .filter(|(_, e)| e.until_ts <= now_ts)
+            .filter(|(_, e)| e.until_ts <= ts)
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -155,10 +252,42 @@ impl DecisionEngine {
         }
     }
 
-    pub fn housekeeping(&mut self, now_ts: i64) -> Vec<Action> {
+    /// Limpiar pending buys que excedieron timeout (45s)
+    fn cleanup_pending_timeouts(&mut self) {
+        let now = now_ts();
+        let expired: Vec<String> = self
+            .state
+            .pending_buys
+            .iter()
+            .filter(|(_, p)| now - p.started_at > PENDING_TIMEOUT_SECS)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for mint in expired {
+            if let Some(pending) = self.state.pending_buys.remove(&mint) {
+                println!(
+                    "⏱️ [ENGINE] Pending TIMEOUT ({}s) | mint={} | intended_sol={:.4}",
+                    PENDING_TIMEOUT_SECS,
+                    &mint[..8.min(mint.len())],
+                    pending.intended_sol
+                );
+                // Cooldown corto
+                self.state.cooldown_blacklist.insert(
+                    mint,
+                    CooldownEntry {
+                        reason: "pending_timeout".to_string(),
+                        until_ts: now + 30,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn housekeeping(&mut self, ts: i64) -> Vec<Action> {
         let mut actions: Vec<Action> = vec![];
 
-        self.cleanup_cooldowns(now_ts);
+        self.cleanup_cooldowns(ts);
+        self.cleanup_pending_timeouts();
 
         if self.risk.max_hold_secs <= 0 {
             return actions;
@@ -167,25 +296,19 @@ impl DecisionEngine {
         let mut to_force_sell: Vec<String> = vec![];
 
         for (mint, pos) in self.state.open_positions.iter() {
-            let age = now_ts - pos.opened_ts;
+            let age = ts - pos.opened_ts;
             if age >= self.risk.max_hold_secs {
                 to_force_sell.push(mint.clone());
             }
         }
 
         for mint in to_force_sell {
-            self.state.open_positions.remove(&mint);
-
+            // No remover aquí, el executor lo hará si tiene éxito
             actions.push(Action::Sell {
                 mint: mint.clone(),
                 reason: "max_hold".to_string(),
             });
-
-            println!("⏳ [FALLBACK] Max-hold alcanzado -> FORZAR SELL mint={}", mint);
-        }
-
-        if !actions.is_empty() {
-            self.save_state();
+            println!("⏳ [FALLBACK] Max-hold alcanzado -> FORZAR SELL mint={}", &mint[..8.min(mint.len())]);
         }
 
         actions
@@ -244,25 +367,31 @@ impl DecisionEngine {
         }
 
         // 3. Rate limit (min_buy_interval_secs)
-        if s.ts - self.state.last_buy_ts < self.risk.min_buy_interval_secs {
+        let now = now_ts();
+        if now - self.state.last_buy_ts < self.risk.min_buy_interval_secs {
             let reason = format!(
                 "rate_limit ({}s desde último BUY) -> SKIP | mint={}",
-                s.ts - self.state.last_buy_ts, &s.mint[..8.min(s.mint.len())]
+                now - self.state.last_buy_ts, &s.mint[..8.min(s.mint.len())]
             );
             println!("⚠️ [RATE] {}", reason);
             return Action::Skip { reason };
         }
 
-        // 4. Check posición existente
+        // 4. IDEMPOTENCIA: Check posición existente O pending
         if self.state.open_positions.contains_key(&s.mint) {
-            let reason = format!("Ya hay posición -> SKIP BUY | mint={}", &s.mint[..8.min(s.mint.len())]);
+            let reason = format!("Ya hay posición abierta -> SKIP BUY | mint={}", &s.mint[..8.min(s.mint.len())]);
+            println!("⚠️ [RISK] {}", reason);
+            return Action::Skip { reason };
+        }
+        if self.state.pending_buys.contains_key(&s.mint) {
+            let reason = format!("Ya hay pending BUY -> SKIP | mint={}", &s.mint[..8.min(s.mint.len())]);
             println!("⚠️ [RISK] {}", reason);
             return Action::Skip { reason };
         }
 
         // 5. Check cooldown blacklist
         if let Some(entry) = self.state.cooldown_blacklist.get(&s.mint) {
-            if s.ts < entry.until_ts {
+            if now < entry.until_ts {
                 let reason = format!(
                     "Mint en cooldown ({}) -> SKIP | mint={}",
                     entry.reason, &s.mint[..8.min(s.mint.len())]
@@ -274,7 +403,7 @@ impl DecisionEngine {
 
         // 6. Check orphan sell reciente
         if let Some(orphan) = self.state.orphan_sells.get(&s.mint) {
-            if s.ts - orphan.sell_ts < self.risk.cooldown_secs {
+            if now - orphan.sell_ts < self.risk.cooldown_secs {
                 let reason = format!(
                     "BUY después de orphan SELL (<{}s) -> SKIP | mint={}",
                     self.risk.cooldown_secs, &s.mint[..8.min(s.mint.len())]
@@ -310,21 +439,13 @@ impl DecisionEngine {
         }
 
         // ========== PASSED QUALITY GATE ==========
+        // NO guardar en open_positions todavía - solo agregar a pending
+        // La posición se confirma cuando executor verifica balance > 0
 
-        let pos = Position {
-            mint: s.mint.clone(),
-            opened_sig: s.sig.clone(),
-            opened_ts: s.ts,
-            leader_sol_delta_at_open: s.leader_sol_delta,
-            my_trade_sol,
-        };
-
-        self.state.open_positions.insert(s.mint.clone(), pos);
-        self.state.last_buy_ts = s.ts;
-        self.save_state();
+        self.add_pending_buy(&s.mint, my_trade_sol, &s.sig, s.leader_sol_delta);
 
         println!(
-            "✅ [COPY] ABRIRÍA POSICIÓN | mint={} | my_sol={:.4} | leader_delta={:.4} | exposure={:.4}+{:.4}={:.4}",
+            "🎯 [COPY] Intentando BUY | mint={} | my_sol={:.4} | leader_delta={:.4} | exposure={:.4}+{:.4}={:.4}",
             &s.mint[..8.min(s.mint.len())],
             my_trade_sol,
             s.leader_sol_delta,
@@ -336,48 +457,67 @@ impl DecisionEngine {
         Action::Buy {
             mint: s.mint,
             sol_amount: my_trade_sol,
-            reason: "copy_buy".to_string(),
+            leader_delta: s.leader_sol_delta,
+            leader_sig: s.sig,
         }
     }
 
     fn on_sell(&mut self, s: TradeSignal) -> Action {
-        if let Some(pos) = self.state.open_positions.remove(&s.mint) {
-            self.save_state();
+        let now = now_ts();
+        
+        // Caso 1: Posición abierta confirmada -> vender
+        if self.state.open_positions.contains_key(&s.mint) {
+            // No remover aquí - el main loop lo hará si el SELL tiene éxito
+            let pos = self.state.open_positions.get(&s.mint).unwrap();
             println!(
-                "✅ [COPY] CERRARÍA POSICIÓN | mint={} | my_sol={:.4} | sig={}",
+                "🎯 [COPY] Intentando SELL | mint={} | my_sol={:.4} | leader_sig={}",
                 &s.mint[..8.min(s.mint.len())],
                 pos.my_trade_sol,
                 &s.sig[..8.min(s.sig.len())]
             );
-            Action::Sell {
+            return Action::Sell {
                 mint: s.mint,
                 reason: "leader_sell".to_string(),
-            }
-        } else {
-            self.state.orphan_sells.insert(
-                s.mint.clone(),
-                OrphanSell {
-                    sell_sig: s.sig.clone(),
-                    sell_ts: s.ts,
-                },
-            );
-
-            self.state.cooldown_blacklist.insert(
-                s.mint.clone(),
-                CooldownEntry {
-                    reason: "orphan_sell".to_string(),
-                    until_ts: s.ts + self.risk.cooldown_secs,
-                },
-            );
-
-            self.save_state();
-
-            let reason = format!(
-                "SELL sin posición -> IGNORE + cooldown | mint={}",
+            };
+        }
+        
+        // Caso 2: Hay pending BUY -> esperar y reintentar
+        if self.state.pending_buys.contains_key(&s.mint) {
+            println!(
+                "⏳ [COPY] SELL llegó pero BUY pending | mint={} | esperando...",
                 &s.mint[..8.min(s.mint.len())]
             );
-            println!("ℹ️ [ORPHAN] {}", reason);
-            Action::Skip { reason }
+            return Action::WaitAndSell {
+                mint: s.mint,
+                wait_ms: 2000,    // 2 segundos entre intentos
+                max_retries: 3,  // máximo 3 intentos (total ~6s)
+            };
         }
+        
+        // Caso 3: Ni posición ni pending -> orphan sell
+        self.state.orphan_sells.insert(
+            s.mint.clone(),
+            OrphanSell {
+                sell_sig: s.sig.clone(),
+                sell_ts: now,
+            },
+        );
+
+        self.state.cooldown_blacklist.insert(
+            s.mint.clone(),
+            CooldownEntry {
+                reason: "orphan_sell".to_string(),
+                until_ts: now + self.risk.cooldown_secs,
+            },
+        );
+
+        self.save_state();
+
+        let reason = format!(
+            "SELL sin posición ni pending -> orphan + cooldown | mint={}",
+            &s.mint[..8.min(s.mint.len())]
+        );
+        println!("ℹ️ [ORPHAN] {}", reason);
+        Action::Skip { reason }
     }
 }
