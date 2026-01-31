@@ -5,8 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Result, anyhow};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcTransactionConfig;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signer, read_keypair_file};
+use solana_sdk::signature::{Keypair, Signer, read_keypair_file, Signature};
+use solana_transaction_status::UiTransactionEncoding;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use tokio::time::sleep;
 
 use crate::broadcaster::{BroadcastConfig, BroadcastResult, Broadcaster};
@@ -244,12 +248,30 @@ impl Executor {
         
         metrics.mark_send_done();
 
-        // CRITICAL: Esperar indexado y verificar balance real
+        // CRITICAL: Verificar tokens recibidos
+        // 1) Primero por postTokenBalances de la tx (ultra robusto, no depende del indexado)
         println!("⏳ [EXEC] Verificando balance...");
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(300)).await;
 
-        let token_balance = self.get_token_balance_with_retry(&payer.pubkey(), &mint_pubkey, 3).await?;
-        
+        let token_balance = match self.verify_tokens_from_tx(&sig, &payer.pubkey(), mint).await? {
+            Some(amt) => {
+                if amt > 0 {
+                    println!("   ✓ [TX] postTokenBalances confirma {} tokens", amt);
+                    amt
+                } else {
+                    metrics.mark_confirm_done();
+                    let m = metrics.finalize(false, Some("No tokens in postTokenBalances".to_string()));
+                    m.log("BUY", mint);
+                    return Err(anyhow!("BUY tx confirmada pero postTokenBalances=0 (sig={})", sig));
+                }
+            }
+            None => {
+                // 2) Fallback: ATA con retry (tx puede tardar en indexarse)
+                println!("   [EXEC] postTokenBalances no disponible, usando get_token_balance...");
+                self.get_token_balance_with_retry(&payer.pubkey(), &mint_pubkey, 8).await?
+            }
+        };
+
         if token_balance == 0 {
             metrics.mark_confirm_done();
             let m = metrics.finalize(false, Some("No tokens received".to_string()));
@@ -306,7 +328,7 @@ impl Executor {
             .map_err(|_| anyhow!("Invalid mint address: {}", mint))?;
         
         // Get token balance con retry (el RPC puede tardar en indexar)
-        let token_balance = self.get_token_balance_with_retry(&payer.pubkey(), &mint_pubkey, 3).await?;
+        let token_balance = self.get_token_balance_with_retry(&payer.pubkey(), &mint_pubkey, 8).await?;
 
         if token_balance == 0 {
             return Err(anyhow!("No tokens to sell (balance=0)"));
@@ -356,44 +378,91 @@ impl Executor {
         })
     }
 
-    /// Get token balance for a specific mint from user's ATA
+    /// Verificación ultra robusta: lee postTokenBalances de la tx confirmada
+    /// Evita depender del indexado del ATA - la tx ya tiene la info
+    async fn verify_tokens_from_tx(&self, sig: &Signature, owner: &Pubkey, mint: &str) -> Result<Option<u64>> {
+        let cfg = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::JsonParsed),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+
+        let tx = match self.rpc_client.get_transaction_with_config(sig, cfg).await {
+            Ok(t) => t,
+            Err(_) => return Ok(None), // Tx aún no indexada
+        };
+
+        let meta = match tx.transaction.meta {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let post: Vec<_> = match meta.post_token_balances.into() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let owner_str = owner.to_string();
+
+        for b in &post {
+            let bal_owner: Option<String> = b.owner.clone().into();
+            if bal_owner.as_deref() != Some(owner_str.as_str()) {
+                continue;
+            }
+            if b.mint != mint {
+                continue;
+            }
+            let amount: u64 = b.ui_token_amount.amount.parse().unwrap_or(0);
+            return Ok(Some(amount)); // Encontrado: puede ser 0 o >0
+        }
+
+        Ok(None) // No encontramos owner+mint -> fallback a ATA
+    }
+
+    /// Devuelve el token_program_id real (Tokenkeg o Token-2022) mirando el owner del mint
+    async fn get_mint_token_program_id(&self, mint: &Pubkey) -> Result<Pubkey> {
+        let mint_acc = self.rpc_client.get_account(mint).await?;
+        Ok(mint_acc.owner)
+    }
+
+    /// Get token balance usando ATA correcto para SPL Token o Token-2022
     async fn get_token_balance(&self, owner: &Pubkey, mint: &Pubkey) -> Result<u64> {
-        use solana_sdk::program_pack::Pack;
-        
-        // Derive ATA address
-        let ata = spl_associated_token_account::get_associated_token_address(owner, mint);
-        
-        // Get account data
-        match self.rpc_client.get_account(&ata).await {
-            Ok(account) => {
-                // Parse token account data
-                let token_account = spl_token::state::Account::unpack(&account.data)
-                    .map_err(|e| anyhow!("Failed to parse token account: {}", e))?;
-                Ok(token_account.amount)
+        // 1) Detectar token program real del mint (SPL Token o Token-2022)
+        let token_program_id = self.get_mint_token_program_id(mint).await?;
+
+        // 2) Derivar ATA correcto para ESE token program
+        let ata = get_associated_token_address_with_program_id(owner, mint, &token_program_id);
+
+        // 3) Pedir balance por RPC getTokenAccountBalance (no parsear data manualmente)
+        match self.rpc_client.get_token_account_balance(&ata).await {
+            Ok(bal) => {
+                // bal.amount es string entero en base units (u64)
+                let amount: u64 = bal.amount.parse().unwrap_or(0);
+                Ok(amount)
             }
-            Err(_) => {
-                // Account doesn't exist = 0 balance
-                Ok(0)
-            }
+            Err(_) => Ok(0), // ATA no existe / no indexado / etc.
         }
     }
 
-    /// Get token balance con reintentos (el RPC puede tardar en indexar después de un swap)
+    /// Get token balance con reintentos y backoff progresivo
     async fn get_token_balance_with_retry(&self, owner: &Pubkey, mint: &Pubkey, max_retries: u32) -> Result<u64> {
+        let mut wait_ms = 500u64;
+
         for attempt in 0..max_retries {
             let balance = self.get_token_balance(owner, mint).await?;
-            
+
             if balance > 0 {
                 return Ok(balance);
             }
-            
+
             if attempt < max_retries - 1 {
-                println!("   [EXEC] Balance=0, retry {}/{} en 500ms...", attempt + 1, max_retries);
-                sleep(Duration::from_millis(500)).await;
+                println!("   [EXEC] Balance=0, retry {}/{} en {}ms...", attempt + 1, max_retries, wait_ms);
+                sleep(Duration::from_millis(wait_ms)).await;
+                wait_ms = (wait_ms * 2).min(4000); // backoff: 500 -> 1000 -> 2000 -> 4000 (cap 4s)
             }
         }
-        
-        Ok(0)  // Retorna 0 si todos los intentos fallan
+
+        Ok(0)
     }
 
     /// Maneja el resultado del broadcast con confirmación async
