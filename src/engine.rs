@@ -325,7 +325,7 @@ impl DecisionEngine {
 
             // Cooldown según tipo de fallo (invalid_mint lo maneja main con add_invalid_mint_cooldown)
             let (cooldown_secs, cooldown_reason) = if record_reason == "quote_no_route" {
-                (30 * 60, "no_route") // 30 min para no_route
+                (2 * 60, "no_route") // 2 min (Jupiter sin ruta: retry antes por si hay liquidez)
             } else {
                 (30, "pending_failed") // 30s default
             };

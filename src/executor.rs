@@ -425,6 +425,10 @@ impl Executor {
                         println!("   ⚡ [RETRY] sell slippage -> {}bps...", next_slippage);
                         continue;
                     }
+                    if err_str.contains("Blockhash not found") && attempt < slippage_levels.len() - 1 {
+                        println!("   ⚡ [RETRY] Blockhash stale, requoting...");
+                        continue;
+                    }
                     break;
                 }
             }

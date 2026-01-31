@@ -454,9 +454,23 @@ async fn run_sell_all(cfg: &Config) -> anyhow::Result<()> {
 
         for (mint, _) in &to_sell {
             println!("\n🔄 Vendiendo {}...", &mint[..8.min(mint.len())]);
-            match executor.execute_sell(mint, "sell_all").await {
-                Ok(r) => println!("   ✅ Vendido | ~{:.6} SOL", r.sol_received),
-                Err(e) => eprintln!("   ⚠️ Falló: {}", e),
+            for retry in 0..3 {
+                match executor.execute_sell(mint, "sell_all").await {
+                    Ok(r) => {
+                        println!("   ✅ Vendido | ~{:.6} SOL", r.sol_received);
+                        break;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("Blockhash not found") && retry < 2 {
+                            println!("   ⚡ Blockhash expirado, reintentando ({})...", retry + 2);
+                            sleep(Duration::from_secs(1)).await;
+                        } else {
+                            eprintln!("   ⚠️ Falló: {}", e);
+                            break;
+                        }
+                    }
+                }
             }
             sleep(Duration::from_secs(2)).await; // pausa entre ventas
         }
