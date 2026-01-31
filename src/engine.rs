@@ -88,11 +88,22 @@ pub enum Action {
     Skip { reason: String },
 }
 
+/// BUY fallido reciente (para no generar orphan cuando líder vende justo después)
+#[derive(Debug, Clone)]
+pub struct FailedBuyEntry {
+    pub ts: i64,
+    pub reason: String,
+}
+
+const FAILED_BUY_TTL_SECS: i64 = 120;
+
 pub struct DecisionEngine {
     pub risk: RiskConfig,
     pub state: EngineState,
     /// Posiciones con balance > 0 no trackeadas (fuera del state por reset/etc)
     pub untracked_positions: HashMap<String, u64>,
+    /// BUYs fallidos recientes (mint -> {ts, reason}), TTL 120s
+    pub recent_failed_buys: HashMap<String, FailedBuyEntry>,
     state_path: String,
 }
 
@@ -153,8 +164,23 @@ impl DecisionEngine {
             risk,
             state,
             untracked_positions: HashMap::new(),
+            recent_failed_buys: HashMap::new(),
             state_path,
         }
+    }
+
+    /// Registrar BUY fallido (para no marcar orphan si llega SELL del líder)
+    pub fn record_failed_buy(&mut self, mint: &str, reason: &str) {
+        self.recent_failed_buys.insert(
+            mint.to_string(),
+            FailedBuyEntry { ts: now_ts(), reason: reason.to_string() },
+        );
+    }
+
+    /// Limpiar entries expirados de recent_failed_buys
+    fn cleanup_recent_failed_buys(&mut self) {
+        let now = now_ts();
+        self.recent_failed_buys.retain(|_, e| now - e.ts < FAILED_BUY_TTL_SECS);
     }
 
     /// Reconciliación al inicio: compara balances reales vs open_positions
@@ -551,7 +577,30 @@ impl DecisionEngine {
             };
         }
         
-        // Caso 4: Ni posición ni pending ni untracked -> orphan sell
+        // Caso 4: Ni posición ni pending ni untracked
+        // Si hubo BUY fallido reciente -> no orphan (solo cooldown)
+        self.cleanup_recent_failed_buys();
+        if let Some(failed) = self.recent_failed_buys.get(&s.mint) {
+            if now - failed.ts < FAILED_BUY_TTL_SECS {
+                self.state.cooldown_blacklist.insert(
+                    s.mint.clone(),
+                    CooldownEntry {
+                        reason: format!("failed_buy_recent: {}", failed.reason),
+                        until_ts: now + self.risk.cooldown_secs,
+                    },
+                );
+                self.save_state();
+                println!(
+                    "ℹ️ [SKIP] SELL sin posición pero BUY falló hace {}s -> cooldown (no orphan) | mint={}",
+                    now - failed.ts, &s.mint[..8.min(s.mint.len())]
+                );
+                return Action::Skip {
+                    reason: format!("recent_failed_buy ({})", failed.reason),
+                };
+            }
+        }
+
+        // Caso 5: Real orphan
         self.state.orphan_sells.insert(
             s.mint.clone(),
             OrphanSell {

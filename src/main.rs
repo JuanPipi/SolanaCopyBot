@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         keypair_path: cfg.keypair_path.clone(),
         jupiter_api_key: cfg.jupiter_api_key.clone(),
         slippage_bps: 300, // 3% slippage (pump tokens volatiles)
+        reserve_sol: risk.reserve_sol,
     };
 
     println!("🎮 Executor Config:");
@@ -189,10 +190,14 @@ async fn main() -> anyhow::Result<()> {
                                         );
                                     }
                                     Err(e) => {
-                                        engine.cancel_pending_buy(&mint, &e.to_string());
                                         let err_str = e.to_string();
-                                        if err_str.contains("0x2") || err_str.contains("Invalid Mint") {
+                                        engine.cancel_pending_buy(&mint, &err_str);
+                                        engine.record_failed_buy(&mint, &err_str);
+                                        if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("Mint invalid") {
                                             engine.add_invalid_mint_cooldown(&mint, 60 * 60); // 60 min
+                                        }
+                                        if err_str.contains("insufficient_sol") {
+                                            println!("   ⛔ [GUARD] No se intentó swap (balance insuficiente)");
                                         }
                                     }
                                 }
@@ -208,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
                                     Err(e) => {
                                         eprintln!("⚠️ [MAIN] SELL failed for {}: {}", &mint[..8.min(mint.len())], e);
                                         let err_str = e.to_string();
-                                        if err_str.contains("0x2") || err_str.contains("Invalid Mint") {
+                                        if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("Mint invalid") {
                                             engine.add_invalid_mint_cooldown(&mint, 60 * 60); // 60 min
                                         }
                                     }
@@ -232,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
                                             Err(e) => {
                                                 eprintln!("⚠️ [WAIT] SELL delayed failed: {}", e);
                                                 let err_str = e.to_string();
-                                                if err_str.contains("0x2") || err_str.contains("Invalid Mint") {
+                                                if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("Mint invalid") {
                                                     engine.add_invalid_mint_cooldown(&mint, 60 * 60);
                                                 }
                                             }

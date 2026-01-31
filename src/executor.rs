@@ -48,6 +48,8 @@ pub struct ExecutorConfig {
     pub keypair_path: Option<String>,
     pub jupiter_api_key: Option<String>,
     pub slippage_bps: u16,
+    /// Reserva SOL intocable (para balance guard)
+    pub reserve_sol: f64,
 }
 
 impl Default for ExecutorConfig {
@@ -64,6 +66,7 @@ impl Default for ExecutorConfig {
             keypair_path: None,
             jupiter_api_key: None,
             slippage_bps: 100, // 1% default
+            reserve_sol: 0.05,
         }
     }
 }
@@ -165,6 +168,13 @@ impl Executor {
             });
         }
 
+        // Balance guard ANTES de intentar (evita insufficient lamports)
+        let payer = self.payer.as_ref().ok_or_else(|| anyhow!("No keypair loaded"))?;
+        let mint_pubkey: Pubkey = mint.parse().map_err(|_| anyhow!("Invalid mint: {}", mint))?;
+        if let Err(e) = self.check_buy_balance(payer.pubkey(), sol_amount, &mint_pubkey).await {
+            return Err(e);
+        }
+
         // Slippage levels para retry: 300 -> 450 -> 600 -> 800 bps
         let slippage_levels = [
             self.config.slippage_bps,                    // Default (300)
@@ -225,6 +235,11 @@ impl Executor {
         let amount_lamports = sol_to_lamports(sol_amount);
         let mint_pubkey: Pubkey = mint.parse()
             .map_err(|_| anyhow!("Invalid mint address: {}", mint))?;
+
+        // Validación de mint real (owner = Tokenkeg o TokenzQd)
+        if let Err(e) = self.validate_mint(&mint_pubkey).await {
+            return Err(anyhow!("Mint invalid: {}", e));
+        }
 
         // Quote + build + send con retry si tx "too large"
         let params_list = [
@@ -401,8 +416,13 @@ impl Executor {
                 Err(e) => {
                     let err_str = e.to_string();
                     last_error = e;
+                    // No retry para errores que slippage no arregla
+                    if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("insufficient") || err_str.contains("balance=0") {
+                        break;
+                    }
                     if err_str.contains("0x1771") && attempt < slippage_levels.len() - 1 {
-                        println!("   ⚡ [RETRY] Slippage exceeded, retrying con {}bps...", slippage_levels[attempt + 1]);
+                        let next_slippage = slippage_levels[attempt + 1];
+                        println!("   ⚡ [RETRY] sell slippage -> {}bps...", next_slippage);
                         continue;
                     }
                     break;
@@ -603,6 +623,57 @@ impl Executor {
     async fn get_mint_token_program_id(&self, mint: &Pubkey) -> Result<Pubkey> {
         let mint_acc = self.rpc_client.get_account(mint).await?;
         Ok(mint_acc.owner)
+    }
+
+    const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+    /// Valida que el mint existe y pertenece a SPL Token o Token-2022
+    async fn validate_mint(&self, mint: &Pubkey) -> Result<()> {
+        let mint_acc = self.rpc_client.get_account_with_commitment(mint, CommitmentConfig::finalized())
+            .await
+            .map_err(|e| anyhow!("get_account mint failed: {}", e))?;
+        let acc = mint_acc.value.ok_or_else(|| anyhow!("Mint account not found"))?;
+        let owner_str = acc.owner.to_string();
+        if owner_str != Self::TOKEN_PROGRAM && owner_str != Self::TOKEN_2022_PROGRAM {
+            return Err(anyhow!("Mint owner {} not a valid token program", owner_str));
+        }
+        Ok(())
+    }
+
+    /// Buffer para ATA rent si el ATA no existe (~0.003 SOL)
+    const ATA_RENT_BUFFER_LAMPORTS: u64 = 3_000_000;
+    /// Buffer adicional para fees/tx
+    const FEE_BUFFER_LAMPORTS: u64 = 500_000;
+
+    /// Verifica balance suficiente antes de BUY (evita insufficient lamports)
+    async fn check_buy_balance(&self, owner: Pubkey, sol_amount: f64, mint: &Pubkey) -> Result<()> {
+        let balance = self.rpc_client.get_balance(&owner).await?;
+        let trade_lamports = sol_to_lamports(sol_amount);
+        let reserve_lamports = sol_to_lamports(self.config.reserve_sol);
+        let fee_buffer = Self::FEE_BUFFER_LAMPORTS;
+
+        let ata_buffer = {
+            let token_program = self.get_mint_token_program_id(mint).await?;
+            let ata = get_associated_token_address_with_program_id(&owner, mint, &token_program);
+            match self.rpc_client.get_account_with_commitment(&ata, CommitmentConfig::confirmed()).await {
+                Ok(res) if res.value.is_some() => 0,
+                _ => Self::ATA_RENT_BUFFER_LAMPORTS,
+            }
+        };
+
+        let required = trade_lamports + reserve_lamports + fee_buffer + ata_buffer;
+        if balance < required {
+            return Err(anyhow!(
+                "insufficient_sol: balance={} lamports ({:.4} SOL), need {} (trade={:.4}+reserve={:.4}+buffer)",
+                balance,
+                balance as f64 / 1e9,
+                required,
+                sol_amount,
+                self.config.reserve_sol
+            ));
+        }
+        Ok(())
     }
 
     /// Get token balance usando ATA correcto para SPL Token o Token-2022
