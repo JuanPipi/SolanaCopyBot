@@ -277,19 +277,44 @@ impl DecisionEngine {
         println!("🚫 [ENGINE] Mint en cooldown {}min | mint={} (Invalid Mint / ruta Token-2022)", duration_secs / 60, &mint[..8.min(mint.len())]);
     }
 
-    /// Cancelar pending (si executor falla)
+    /// Cancelar pending BUY (si executor falla) - SIEMPRE registra failed_buy para anti-orphan
     pub fn cancel_pending_buy(&mut self, mint: &str, reason: &str) {
         if self.state.pending_buys.remove(mint).is_some() {
-            // Agregar cooldown corto para no reintentar inmediatamente
+            // Normalizar reason para record
+            let record_reason = if reason.contains("COULD_NOT_FIND_ANY_ROUTE") || reason.contains("no route") || reason.contains("Quote failed") {
+                "quote_no_route"
+            } else if reason.contains("insufficient") {
+                "insufficient_sol"
+            } else if reason.contains("0x2") || reason.contains("Invalid Mint") || reason.contains("Mint invalid") {
+                "invalid_mint"
+            } else {
+                reason
+            };
+            let record_reason_short = if record_reason.len() > 60 {
+                format!("{}...", &record_reason[..57])
+            } else {
+                record_reason.to_string()
+            };
+
+            self.record_failed_buy(mint, &record_reason_short);
+            println!("📝 [ENGINE] failed_buy recorded | mint={} | reason={}", &mint[..8.min(mint.len())], record_reason_short);
+
+            // Cooldown según tipo de fallo (invalid_mint lo maneja main con add_invalid_mint_cooldown)
+            let (cooldown_secs, cooldown_reason) = if record_reason == "quote_no_route" {
+                (30 * 60, "no_route") // 30 min para no_route
+            } else {
+                (30, "pending_failed") // 30s default
+            };
+
             self.state.cooldown_blacklist.insert(
                 mint.to_string(),
                 CooldownEntry {
-                    reason: format!("pending_failed: {}", reason),
-                    until_ts: now_ts() + 30, // 30s cooldown
+                    reason: format!("{}: {}", cooldown_reason, &record_reason_short[..record_reason_short.len().min(40)]),
+                    until_ts: now_ts() + cooldown_secs,
                 },
             );
             self.save_state();
-            println!("❌ [ENGINE] Pending CANCELADO | mint={} | reason={}", &mint[..8.min(mint.len())], reason);
+            println!("❌ [ENGINE] Pending CANCELADO | mint={} | reason={}", &mint[..8.min(mint.len())], record_reason_short);
         }
     }
 

@@ -191,8 +191,7 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                     Err(e) => {
                                         let err_str = e.to_string();
-                                        engine.cancel_pending_buy(&mint, &err_str);
-                                        engine.record_failed_buy(&mint, &err_str);
+                                        engine.cancel_pending_buy(&mint, &err_str); // incluye record_failed_buy
                                         if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("Mint invalid") {
                                             engine.add_invalid_mint_cooldown(&mint, 60 * 60); // 60 min
                                         }
