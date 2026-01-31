@@ -148,6 +148,11 @@ impl Executor {
         }
     }
 
+    /// Pubkey del owner (para reconciliación)
+    pub fn owner_pubkey(&self) -> Option<Pubkey> {
+        self.payer.as_ref().map(|p| p.pubkey())
+    }
+
     /// Ejecuta BUY con slippage dinámico (retry si falla por 0x1771)
     pub async fn execute_buy(&mut self, mint: &str, sol_amount: f64) -> Result<BuyExecutionResult> {
         // DRY RUN: simular éxito
@@ -521,6 +526,68 @@ impl Executor {
             }
             Err(_) => Ok(0), // ATA no existe / no indexado / etc.
         }
+    }
+
+    /// Obtiene todos los token accounts del owner (SPL + Token-2022)
+    pub async fn get_all_token_balances(&self, owner: &Pubkey) -> Result<std::collections::HashMap<String, u64>> {
+        use reqwest::Client;
+        use serde_json::Value;
+
+        let mut result = std::collections::HashMap::new();
+        let owner_str = owner.to_string();
+
+        for program_id in &[
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  // Token-2022
+        ] {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    owner_str,
+                    { "programId": program_id },
+                    { "encoding": "jsonParsed" }
+                ]
+            });
+
+            let client = Client::new();
+            let res = client
+                .post(&self.config.rpc_url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("getTokenAccountsByOwner req: {}", e))?;
+
+            let json: Value = res.json().await.map_err(|e| anyhow!("parse response: {}", e))?;
+            let value = json.get("result").and_then(|r| r.get("value"));
+            let accounts = match value {
+                Some(serde_json::Value::Array(arr)) => arr,
+                _ => continue,
+            };
+
+            for acc in accounts {
+                if let Some(info) = acc
+                    .get("account")
+                    .and_then(|a| a.get("data"))
+                    .and_then(|d| d.get("parsed"))
+                    .and_then(|p| p.get("info"))
+                {
+                    let mint = info.get("mint").and_then(|m| m.as_str()).unwrap_or("").to_string();
+                    let amount_str = info
+                        .get("tokenAmount")
+                        .and_then(|t| t.get("amount"))
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("0");
+                    let amount: u64 = amount_str.parse().unwrap_or(0);
+                    if !mint.is_empty() && amount > 0 {
+                        result.insert(mint, amount);
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get token balance con reintentos y backoff progresivo

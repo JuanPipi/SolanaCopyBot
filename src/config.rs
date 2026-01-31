@@ -12,6 +12,8 @@ pub struct Config {
     pub keypair_path: Option<String>,
     // Jupiter API (optional, increases rate limits)
     pub jupiter_api_key: Option<String>,
+    /// Si true, vender posiciones untracked cuando el líder vende (default: true)
+    pub reconcile_untracked_sell: bool,
 }
 
 impl Config {
@@ -47,6 +49,11 @@ impl Config {
         // Jupiter API key (optional, increases rate limits)
         let jupiter_api_key = env::var("JUP_API_KEY").ok().filter(|s| !s.is_empty());
 
+        let reconcile_untracked_sell = env::var("RECONCILE_UNTRACKED_SELL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(true);
+
         println!("📋 Loaded {} wallet(s) to follow", wallets.len());
         if jito_url.is_some() {
             println!("📦 Jito enabled: tip={} lamports", jito_tip_lamports);
@@ -69,6 +76,7 @@ impl Config {
             jito_auth,
             keypair_path,
             jupiter_api_key,
+            reconcile_untracked_sell,
         }
     }
 

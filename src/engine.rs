@@ -27,6 +27,9 @@ pub struct RiskConfig {
     pub min_buy_interval_secs: i64, // segundos mínimos entre BUYs (ej 15)
     pub cooldown_secs: i64,         // cooldown después de orphan sell (ej 60)
     pub max_hold_secs: i64,         // max hold antes de SELL forzado (ej 6h)
+
+    // Reconciliación: si true, vender untracked cuando el líder vende
+    pub reconcile_untracked_sell: bool,
 }
 
 /// BUY en proceso (antes de confirmar)
@@ -88,6 +91,8 @@ pub enum Action {
 pub struct DecisionEngine {
     pub risk: RiskConfig,
     pub state: EngineState,
+    /// Posiciones con balance > 0 no trackeadas (fuera del state por reset/etc)
+    pub untracked_positions: HashMap<String, u64>,
     state_path: String,
 }
 
@@ -147,7 +152,32 @@ impl DecisionEngine {
         Self {
             risk,
             state,
+            untracked_positions: HashMap::new(),
             state_path,
+        }
+    }
+
+    /// Reconciliación al inicio: compara balances reales vs open_positions
+    pub fn reconcile_untracked(&mut self, real_balances: HashMap<String, u64>) {
+        self.untracked_positions.clear();
+        for (mint, balance) in real_balances {
+            if balance == 0 {
+                continue;
+            }
+            if mint == WSOL_MINT {
+                continue;
+            }
+            if self.state.open_positions.contains_key(&mint) {
+                continue;
+            }
+            self.untracked_positions.insert(mint, balance);
+        }
+        if !self.untracked_positions.is_empty() {
+            println!("⚠️ [RECONCILE] {} posiciones fuera del state (tokens en wallet no trackeados):", self.untracked_positions.len());
+            for (mint, bal) in &self.untracked_positions {
+                println!("   └─ {} | balance={}", &mint[..8.min(mint.len())], bal);
+            }
+            println!("   Si llega SELL del líder para estos mints, se venderá automáticamente.");
         }
     }
 
@@ -481,7 +511,20 @@ impl DecisionEngine {
             };
         }
         
-        // Caso 2: Hay pending BUY -> esperar y reintentar
+        // Caso 2: Posición untracked (reconciliación) -> vender si config lo permite
+        if self.risk.reconcile_untracked_sell && self.untracked_positions.contains_key(&s.mint) {
+            let bal = self.untracked_positions.get(&s.mint).copied().unwrap_or(0);
+            println!(
+                "🔄 [RECONCILE] SELL untracked | mint={} | balance={} | vendiendo (líder vendió)",
+                &s.mint[..8.min(s.mint.len())], bal
+            );
+            return Action::Sell {
+                mint: s.mint,
+                reason: "leader_sell_untracked".to_string(),
+            };
+        }
+
+        // Caso 3: Hay pending BUY -> esperar y reintentar
         if self.state.pending_buys.contains_key(&s.mint) {
             println!(
                 "⏳ [COPY] SELL llegó pero BUY pending | mint={} | esperando...",
@@ -494,7 +537,7 @@ impl DecisionEngine {
             };
         }
         
-        // Caso 3: Ni posición ni pending -> orphan sell
+        // Caso 4: Ni posición ni pending ni untracked -> orphan sell
         self.state.orphan_sells.insert(
             s.mint.clone(),
             OrphanSell {

@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         min_buy_interval_secs: 15,   // evitar spam
         cooldown_secs: 60,           // cooldown después de orphan sell
         max_hold_secs: 6 * 60 * 60,  // 6 horas max hold
+        reconcile_untracked_sell: cfg.reconcile_untracked_sell,
     };
 
     println!("📋 Risk Config (Sizing Dinámico):");
@@ -118,6 +119,13 @@ async fn main() -> anyhow::Result<()> {
 
         println!("✅ Engine y Executor inicializados");
         println!("✅ RpcClient compartido activo");
+
+        // Reconciliación: detectar posiciones fuera del state
+        if let Some(owner) = executor.owner_pubkey() {
+            if let Ok(balances) = executor.get_all_token_balances(&owner).await {
+                engine.reconcile_untracked(balances);
+            }
+        }
 
         while let Some((wallet, sig)) = rxq.recv().await {
             let sig = sig.trim().to_string();
@@ -190,8 +198,9 @@ async fn main() -> anyhow::Result<()> {
                             Action::Sell { mint, reason } => {
                                 match executor.execute_sell(&mint, &reason).await {
                                     Ok(_result) => {
-                                        // ÉXITO: remover posición
+                                        // ÉXITO: remover posición (open o untracked)
                                         engine.remove_position(&mint);
+                                        engine.untracked_positions.remove(&mint);
                                     }
                                     Err(e) => {
                                         // FALLO: mantener posición, loguear error
