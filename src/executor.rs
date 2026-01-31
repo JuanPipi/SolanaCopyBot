@@ -253,7 +253,7 @@ impl Executor {
         println!("⏳ [EXEC] Verificando balance...");
         sleep(Duration::from_millis(300)).await;
 
-        let token_balance = match self.verify_tokens_from_tx(&sig, &payer.pubkey(), mint).await? {
+        let token_balance = match self.verify_tokens_from_tx_with_retry(&sig, &payer.pubkey(), mint, 8).await? {
             Some(amt) => {
                 if amt > 0 {
                     println!("   ✓ [TX] postTokenBalances confirma {} tokens", amt);
@@ -273,6 +273,12 @@ impl Executor {
         };
 
         if token_balance == 0 {
+            // Log diagnóstico para distinguir index delay vs swap fallido vs mint raro
+            if let Ok(token_program) = self.get_mint_token_program_id(&mint_pubkey).await {
+                let ata = get_associated_token_address_with_program_id(&payer.pubkey(), &mint_pubkey, &token_program);
+                eprintln!("   [DIAG] balance=0 | mint={} | token_program={} | ata={}", 
+                    &mint[..8.min(mint.len())], token_program, ata);
+            }
             metrics.mark_confirm_done();
             let m = metrics.finalize(false, Some("No tokens received".to_string()));
             m.log("BUY", mint);
@@ -379,28 +385,80 @@ impl Executor {
     }
 
     /// Verificación ultra robusta: lee postTokenBalances de la tx confirmada
-    /// Evita depender del indexado del ATA - la tx ya tiene la info
-    async fn verify_tokens_from_tx(&self, sig: &Signature, owner: &Pubkey, mint: &str) -> Result<Option<u64>> {
+    /// Con retry (getTransaction puede tardar) y commitment finalized
+    async fn verify_tokens_from_tx_with_retry(
+        &self,
+        sig: &Signature,
+        owner: &Pubkey,
+        mint: &str,
+        max_retries: u32,
+    ) -> Result<Option<u64>> {
+        let mut wait_ms = 300u64;
+        let mut last_err = None::<String>;
+
+        for attempt in 0..max_retries {
+            match self.verify_tokens_from_tx_once(sig, owner, mint).await {
+                Ok(Some(amt)) => return Ok(Some(amt)),
+                Ok(None) => {
+                    // None = tx no disponible o owner+mint no en post
+                    last_err = Some("getTransaction returned null or no match".to_string());
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                }
+            }
+
+            if attempt < max_retries - 1 {
+                println!("   [EXEC] getTransaction attempt {}/{} failed, retry in {}ms", attempt + 1, max_retries, wait_ms);
+                sleep(Duration::from_millis(wait_ms)).await;
+                wait_ms = (wait_ms + 200).min(3000); // 300->500->700->... cap 3s
+            }
+        }
+
+        if let Some(ref e) = last_err {
+            eprintln!("   [DIAG] getTransaction falló tras {} intentos: {}", max_retries, e);
+        }
+        Ok(None)
+    }
+
+    /// Una llamada a getTransaction para verificar postTokenBalances (commitment: finalized)
+    async fn verify_tokens_from_tx_once(&self, sig: &Signature, owner: &Pubkey, mint: &str) -> Result<Option<u64>> {
         let cfg = RpcTransactionConfig {
             encoding: Some(UiTransactionEncoding::JsonParsed),
-            commitment: Some(CommitmentConfig::confirmed()),
+            commitment: Some(CommitmentConfig::finalized()), // más lento pero más real
             max_supported_transaction_version: Some(0),
         };
 
         let tx = match self.rpc_client.get_transaction_with_config(sig, cfg).await {
             Ok(t) => t,
-            Err(_) => return Ok(None), // Tx aún no indexada
+            Err(e) => return Err(anyhow!("getTransaction: {}", e)),
         };
 
         let meta = match tx.transaction.meta {
             Some(m) => m,
-            None => return Ok(None),
+            None => {
+                eprintln!("   [DIAG] meta is None");
+                return Ok(None);
+            }
         };
+
+        // Verificar que la tx no falló
+        if meta.err.is_some() {
+            eprintln!("   [DIAG] meta.err={:?}", meta.err);
+            return Ok(Some(0)); // Tx falló -> 0 tokens
+        }
 
         let post: Vec<_> = match meta.post_token_balances.into() {
             Some(p) => p,
-            None => return Ok(None),
+            None => {
+                eprintln!("   [DIAG] post_token_balances is empty/null");
+                return Ok(None);
+            }
         };
+
+        if post.is_empty() {
+            eprintln!("   [DIAG] post_token_balances vacío (swap puede haber devuelto SOL)");
+        }
 
         let owner_str = owner.to_string();
 
@@ -413,10 +471,18 @@ impl Executor {
                 continue;
             }
             let amount: u64 = b.ui_token_amount.amount.parse().unwrap_or(0);
-            return Ok(Some(amount)); // Encontrado: puede ser 0 o >0
+            return Ok(Some(amount));
         }
 
-        Ok(None) // No encontramos owner+mint -> fallback a ATA
+        // Owner+mint no encontrado en post - log diagnóstico
+        let logs_opt: Option<Vec<String>> = meta.log_messages.clone().into();
+        if let Some(logs) = logs_opt {
+            let tail: Vec<_> = logs.iter().rev().take(3).collect();
+            eprintln!("   [DIAG] owner+mint no en postTokenBalances. Tx logs (last 3): {:?}", tail);
+        } else {
+            eprintln!("   [DIAG] owner+mint no en postTokenBalances (post len={})", post.len());
+        }
+        Ok(None)
     }
 
     /// Devuelve el token_program_id real (Tokenkeg o Token-2022) mirando el owner del mint
