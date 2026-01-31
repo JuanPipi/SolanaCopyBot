@@ -189,8 +189,11 @@ async fn main() -> anyhow::Result<()> {
                                         );
                                     }
                                     Err(e) => {
-                                        // FALLO: cancelar pending
                                         engine.cancel_pending_buy(&mint, &e.to_string());
+                                        let err_str = e.to_string();
+                                        if err_str.contains("0x2") || err_str.contains("Invalid Mint") {
+                                            engine.add_invalid_mint_cooldown(&mint, 60 * 60); // 60 min
+                                        }
                                     }
                                 }
                             }
@@ -203,8 +206,11 @@ async fn main() -> anyhow::Result<()> {
                                         engine.untracked_positions.remove(&mint);
                                     }
                                     Err(e) => {
-                                        // FALLO: mantener posición, loguear error
                                         eprintln!("⚠️ [MAIN] SELL failed for {}: {}", &mint[..8.min(mint.len())], e);
+                                        let err_str = e.to_string();
+                                        if err_str.contains("0x2") || err_str.contains("Invalid Mint") {
+                                            engine.add_invalid_mint_cooldown(&mint, 60 * 60); // 60 min
+                                        }
                                     }
                                 }
                             }
@@ -225,6 +231,10 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                             Err(e) => {
                                                 eprintln!("⚠️ [WAIT] SELL delayed failed: {}", e);
+                                                let err_str = e.to_string();
+                                                if err_str.contains("0x2") || err_str.contains("Invalid Mint") {
+                                                    engine.add_invalid_mint_cooldown(&mint, 60 * 60);
+                                                }
                                             }
                                         }
                                         break;

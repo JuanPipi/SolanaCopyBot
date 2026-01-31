@@ -237,6 +237,20 @@ impl DecisionEngine {
         }
     }
 
+    /// Cooldown agresivo para mints con Invalid Mint (0x2) / Token-2022 problemático
+    pub fn add_invalid_mint_cooldown(&mut self, mint: &str, duration_secs: i64) {
+        let until = now_ts() + duration_secs;
+        self.state.cooldown_blacklist.insert(
+            mint.to_string(),
+            CooldownEntry {
+                reason: "invalid_mint".to_string(),
+                until_ts: until,
+            },
+        );
+        self.save_state();
+        println!("🚫 [ENGINE] Mint en cooldown {}min | mint={} (Invalid Mint / ruta Token-2022)", duration_secs / 60, &mint[..8.min(mint.len())]);
+    }
+
     /// Cancelar pending (si executor falla)
     pub fn cancel_pending_buy(&mut self, mint: &str, reason: &str) {
         if self.state.pending_buys.remove(mint).is_some() {

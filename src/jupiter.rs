@@ -85,6 +85,14 @@ pub struct SwapResult {
     pub quote: QuoteResponse,
 }
 
+/// Parámetros opcionales para el quote (evitar rutas raras / tx demasiado grande)
+#[derive(Debug, Clone, Default)]
+pub struct QuoteParams {
+    pub only_direct_routes: bool,
+    pub max_accounts: Option<u32>,
+    pub restrict_intermediate_tokens: bool,
+}
+
 impl JupiterClient {
     /// Crear nuevo cliente Jupiter
     /// api_key es opcional (sin él funciona pero con rate limits más bajos)
@@ -118,13 +126,26 @@ impl JupiterClient {
         output_mint: &str,
         amount_in: u64,
         slippage_bps: Option<u16>,
+        params: Option<&QuoteParams>,
     ) -> Result<QuoteResponse> {
         let slippage = slippage_bps.unwrap_or(self.default_slippage_bps);
         
-        let url = format!(
+        let mut url = format!(
             "{}/swap/v1/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
             JUP_BASE, input_mint, output_mint, amount_in, slippage
         );
+
+        let default_params = QuoteParams::default();
+        let p = params.unwrap_or(&default_params);
+        if p.only_direct_routes {
+            url.push_str("&onlyDirectRoutes=true");
+        }
+        if let Some(max) = p.max_accounts {
+            url.push_str(&format!("&maxAccounts={}", max));
+        }
+        if p.restrict_intermediate_tokens {
+            url.push_str("&restrictIntermediateTokens=true");
+        }
 
         let resp = self.http.get(&url)
             .send()
@@ -203,6 +224,24 @@ impl JupiterClient {
         })
     }
 
+    /// Params por defecto: rutas más simples, evitar tx demasiado grande
+    pub fn default_quote_params() -> QuoteParams {
+        QuoteParams {
+            only_direct_routes: false,
+            max_accounts: Some(32),
+            restrict_intermediate_tokens: true,
+        }
+    }
+
+    /// Params para retry cuando tx es "too large"
+    pub fn fallback_quote_params() -> QuoteParams {
+        QuoteParams {
+            only_direct_routes: true,
+            max_accounts: Some(24),
+            restrict_intermediate_tokens: true,
+        }
+    }
+
     /// Quote + Build en un solo paso (conveniencia)
     pub async fn quote_and_build(
         &self,
@@ -212,8 +251,9 @@ impl JupiterClient {
         user_pubkey: &Pubkey,
         slippage_bps: Option<u16>,
         priority_fee_lamports: Option<u64>,
+        params: Option<&QuoteParams>,
     ) -> Result<SwapResult> {
-        let quote = self.get_quote(input_mint, output_mint, amount_in, slippage_bps).await?;
+        let quote = self.get_quote(input_mint, output_mint, amount_in, slippage_bps, params).await?;
         self.build_swap_tx(&quote, user_pubkey, priority_fee_lamports).await
     }
 
@@ -270,6 +310,7 @@ mod tests {
             mints::WSOL,
             mints::USDC,
             10_000_000, // 0.01 SOL
+            None,
             None,
         ).await;
         

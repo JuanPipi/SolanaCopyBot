@@ -1,0 +1,14 @@
+---
+description: Siempre subir cambios a GitHub al completar trabajo
+alwaysApply: true
+---
+
+# Push a GitHub
+
+**SIEMPRE** al finalizar parches, fixes o features en este proyecto:
+
+1. `git add` los archivos modificados
+2. `git commit` con mensaje descriptivo
+3. `git push origin main` a https://github.com/JuanPipi/SolanaCopyBot
+
+No esperar a que el usuario lo pida explícitamente. Es parte del flujo de trabajo estándar.

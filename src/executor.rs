@@ -165,11 +165,12 @@ impl Executor {
             });
         }
 
-        // Slippage levels para retry: 300 -> 450 -> 600 bps (3% -> 4.5% -> 6%)
+        // Slippage levels para retry: 300 -> 450 -> 600 -> 800 bps
         let slippage_levels = [
             self.config.slippage_bps,                    // Default (300)
-            self.config.slippage_bps + 150,              // +1.5%
-            self.config.slippage_bps + 300,              // +3%
+            self.config.slippage_bps + 150,              // 450
+            self.config.slippage_bps + 300,              // 600
+            self.config.slippage_bps + 500,              // 800
         ];
 
         let mut last_error = anyhow!("No attempts made");
@@ -225,42 +226,81 @@ impl Executor {
         let mint_pubkey: Pubkey = mint.parse()
             .map_err(|_| anyhow!("Invalid mint address: {}", mint))?;
 
-        // Get quote from Jupiter: SOL -> Token
-        println!("🪐 [JUPITER] Quote: {:.4} SOL -> {} (slippage={}bps)", sol_amount, &mint[..8.min(mint.len())], slippage_bps);
-        let swap_result = jupiter.quote_and_build(
-            mints::WSOL,
-            mint,
-            amount_lamports,
-            &payer.pubkey(),
-            Some(slippage_bps),
-            Some(50_000),
-        ).await.map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
+        // Quote + build + send con retry si tx "too large"
+        let params_list = [
+            JupiterClient::default_quote_params(),
+            JupiterClient::fallback_quote_params(),
+        ];
+        let mut last_err = anyhow!("No attempts");
+        let mut signed_tx_opt = None;
 
-        if let Some(out) = swap_result.quote.out_amount() {
-            println!("   ✓ Quote: {} lamports -> {} tokens", amount_lamports, out);
+        for (i, params) in params_list.iter().enumerate() {
+            let label = if i == 0 { "default" } else { "fallback (onlyDirect)" };
+            println!("🪐 [JUPITER] Quote: {:.4} SOL -> {} (slippage={}bps) [{}]", sol_amount, &mint[..8.min(mint.len())], slippage_bps, label);
+            match jupiter.quote_and_build(
+                mints::WSOL,
+                mint,
+                amount_lamports,
+                &payer.pubkey(),
+                Some(slippage_bps),
+                Some(50_000),
+                Some(params),
+            ).await {
+                Ok(swap_result) => {
+                    if let Some(out) = swap_result.quote.out_amount() {
+                        println!("   ✓ Quote: {} lamports -> {} tokens", amount_lamports, out);
+                    }
+                    signed_tx_opt = Some(jupiter.sign_swap_tx(swap_result, payer)
+                        .map_err(|e| anyhow!("Failed to sign tx: {}", e))?);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                    if i < params_list.len() - 1 {
+                        println!("   ⚡ [RETRY] Quote falló, intentando rutas más simples...");
+                    }
+                }
+            }
         }
 
-        // Sign the transaction
-        let signed_tx = jupiter.sign_swap_tx(swap_result, payer)
-            .map_err(|e| anyhow!("Failed to sign tx: {}", e))?;
-
+        let signed_tx = signed_tx_opt.ok_or_else(|| last_err)?;
         metrics.mark_build_done();
         
-        // Send and confirm
+        // Send and confirm (retry con fallback params si "too large")
         println!("📤 [EXEC] Sending swap transaction...");
         let sig = match self.rpc_client.send_and_confirm_transaction(&signed_tx).await {
             Ok(s) => s,
             Err(e) => {
-                // Si falla, simular para obtener los logs completos
-                if let Ok(sim) = self.rpc_client.simulate_transaction(&signed_tx).await {
-                    if let Some(logs) = sim.value.logs {
-                        eprintln!("   [SIM_LOGS] {} mensajes:", logs.len());
-                        for (i, line) in logs.iter().enumerate() {
-                            eprintln!("      [{}] {}", i + 1, line);
+                let err_str = e.to_string();
+                let is_too_large = err_str.contains("too large") || err_str.contains("1688") || err_str.contains("1644") || err_str.contains("1232");
+                if is_too_large {
+                    println!("   ⚡ [RETRY] Tx too large, requoting con onlyDirectRoutes...");
+                    let fallback = JupiterClient::fallback_quote_params();
+                    let swap_result = jupiter.quote_and_build(
+                        mints::WSOL,
+                        mint,
+                        amount_lamports,
+                        &payer.pubkey(),
+                        Some(slippage_bps),
+                        Some(50_000),
+                        Some(&fallback),
+                    ).await.map_err(|e| anyhow!("Requote failed: {}", e))?;
+                    let retry_tx = jupiter.sign_swap_tx(swap_result, payer)
+                        .map_err(|e| anyhow!("Failed to sign: {}", e))?;
+                    self.rpc_client.send_and_confirm_transaction(&retry_tx).await
+                        .map_err(|e| anyhow!("Send failed (after requote): {}", e))?
+                } else {
+                    // Si falla, simular para obtener los logs completos
+                    if let Ok(sim) = self.rpc_client.simulate_transaction(&signed_tx).await {
+                        if let Some(logs) = sim.value.logs {
+                            eprintln!("   [SIM_LOGS] {} mensajes:", logs.len());
+                            for (i, line) in logs.iter().enumerate() {
+                                eprintln!("      [{}] {}", i + 1, line);
+                            }
                         }
                     }
+                    return Err(anyhow!("Send failed: {}", e));
                 }
-                return Err(anyhow!("Send failed: {}", e));
             }
         };
         
@@ -316,7 +356,7 @@ impl Executor {
         })
     }
 
-    /// Ejecuta SELL y retorna resultado
+    /// Ejecuta SELL con retry por slippage (0x1771) igual que BUY
     pub async fn execute_sell(&mut self, mint: &str, reason: &str) -> Result<SellExecutionResult> {
         let mut metrics = MetricsTracker::new();
 
@@ -342,7 +382,41 @@ impl Executor {
             });
         }
 
-        // REAL EXECUTION
+        // Slippage levels para retry (igual que BUY): 300 -> 450 -> 600 -> 800 bps
+        let slippage_levels = [
+            self.config.slippage_bps,
+            self.config.slippage_bps + 150,
+            self.config.slippage_bps + 300,
+            self.config.slippage_bps + 500,  // 800 bps
+        ];
+
+        let mut last_error = anyhow!("No attempts made");
+        for (attempt, &slippage) in slippage_levels.iter().enumerate() {
+            println!(
+                "🔄 [EXEC] SELL attempt {}/{} | mint={} | slippage={}bps",
+                attempt + 1, slippage_levels.len(), &mint[..8.min(mint.len())], slippage
+            );
+            match self.try_sell_with_slippage(mint, reason, slippage).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    last_error = e;
+                    if err_str.contains("0x1771") && attempt < slippage_levels.len() - 1 {
+                        println!("   ⚡ [RETRY] Slippage exceeded, retrying con {}bps...", slippage_levels[attempt + 1]);
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Intento de SELL con slippage específico
+    async fn try_sell_with_slippage(&mut self, mint: &str, reason: &str, slippage_bps: u16) -> Result<SellExecutionResult> {
+        let mut metrics = MetricsTracker::new();
+        metrics.mark_detect_done();
+
         let payer = self.payer.as_ref()
             .ok_or_else(|| anyhow!("No keypair loaded"))?;
         let jupiter = self.jupiter.as_ref()
@@ -351,22 +425,22 @@ impl Executor {
         let mint_pubkey: Pubkey = mint.parse()
             .map_err(|_| anyhow!("Invalid mint address: {}", mint))?;
         
-        // Get token balance con retry (el RPC puede tardar en indexar)
         let token_balance = self.get_token_balance_with_retry(&payer.pubkey(), &mint_pubkey, 8).await?;
 
         if token_balance == 0 {
             return Err(anyhow!("No tokens to sell (balance=0)"));
         }
 
-        // Get quote from Jupiter: Token -> SOL
-        println!("🪐 [JUPITER] Getting quote: {} tokens -> SOL", token_balance);
+        let quote_params = JupiterClient::default_quote_params();
+        println!("🪐 [JUPITER] Quote: {} tokens -> SOL (slippage={}bps)", token_balance, slippage_bps);
         let swap_result = jupiter.quote_and_build(
             mint,
             mints::WSOL,
             token_balance,
             &payer.pubkey(),
-            Some(self.config.slippage_bps),
+            Some(slippage_bps),
             Some(50_000),
+            Some(&quote_params),
         ).await.map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
 
         let expected_sol = swap_result.quote.out_amount()
@@ -374,19 +448,41 @@ impl Executor {
             .unwrap_or(0.0);
         
         if expected_sol > 0.0 {
-            println!("✅ [JUPITER] Quote: {} tokens -> {:.6} SOL", token_balance, expected_sol);
+            println!("   ✓ Quote: {} tokens -> ~{:.6} SOL", token_balance, expected_sol);
         }
 
-        // Sign
         let signed_tx = jupiter.sign_swap_tx(swap_result, payer)
             .map_err(|e| anyhow!("Failed to sign tx: {}", e))?;
 
         metrics.mark_build_done();
         
-        // Send
         println!("📤 [EXEC] Sending sell transaction...");
-        let sig = self.rpc_client.send_and_confirm_transaction(&signed_tx).await
-            .map_err(|e| anyhow!("Send failed: {}", e))?;
+        let sig = match self.rpc_client.send_and_confirm_transaction(&signed_tx).await {
+            Ok(s) => s,
+            Err(e) => {
+                let err_str = e.to_string();
+                let is_too_large = err_str.contains("too large") || err_str.contains("1688") || err_str.contains("1644") || err_str.contains("1232");
+                if is_too_large {
+                    println!("   ⚡ [RETRY] Tx too large, requoting con onlyDirectRoutes...");
+                    let fallback = JupiterClient::fallback_quote_params();
+                    let swap_result = jupiter.quote_and_build(
+                        mint,
+                        mints::WSOL,
+                        token_balance,
+                        &payer.pubkey(),
+                        Some(slippage_bps),
+                        Some(50_000),
+                        Some(&fallback),
+                    ).await.map_err(|e| anyhow!("Requote failed: {}", e))?;
+                    let retry_tx = jupiter.sign_swap_tx(swap_result, payer)
+                        .map_err(|e| anyhow!("Failed to sign: {}", e))?;
+                    self.rpc_client.send_and_confirm_transaction(&retry_tx).await
+                        .map_err(|e| anyhow!("Send failed (after requote): {}", e))?
+                } else {
+                    return Err(anyhow!("Send failed: {}", e));
+                }
+            }
+        };
         
         metrics.mark_send_done();
         metrics.mark_confirm_done();
