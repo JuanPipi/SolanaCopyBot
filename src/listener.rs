@@ -133,7 +133,7 @@ pub async fn handle_websocket_session(
                                 }
                             }
 
-                            println!("🧾 [{}] TX: {}", &wallet[..std::cmp::min(wallet.len(), 6)], sig);
+                            println!("🧾 [RAW] TX: {} | wallet={}", sig, &wallet[..std::cmp::min(wallet.len(), 6)]);
                             // Enviamos con tag |WS para identificar origen
                             let tagged = format!("{}|WS", wallet);
                             let _ = txq.send((tagged, sig)).await;

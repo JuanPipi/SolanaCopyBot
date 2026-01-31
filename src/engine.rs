@@ -95,7 +95,15 @@ pub struct FailedBuyEntry {
     pub reason: String,
 }
 
-const FAILED_BUY_TTL_SECS: i64 = 120;
+/// BUY ignorado/skippeado (rate-limit, exposure, no copiamos, etc.)
+#[derive(Debug, Clone)]
+pub struct IgnoredMintEntry {
+    pub ts: i64,
+    pub reason: String,
+}
+
+const FAILED_BUY_TTL_SECS: i64 = 120;   // 2 min (buy falló, sell viene enseguida)
+const IGNORED_MINT_TTL_SECS: i64 = 3600; // 60 min (no copiamos, líder puede vender después)
 
 pub struct DecisionEngine {
     pub risk: RiskConfig,
@@ -104,6 +112,8 @@ pub struct DecisionEngine {
     pub untracked_positions: HashMap<String, u64>,
     /// BUYs fallidos recientes (mint -> {ts, reason}), TTL 120s
     pub recent_failed_buys: HashMap<String, FailedBuyEntry>,
+    /// BUYs ignorados/skipped (mint -> {ts, reason}), TTL 60 min
+    pub recent_ignored_mints: HashMap<String, IgnoredMintEntry>,
     state_path: String,
 }
 
@@ -165,8 +175,22 @@ impl DecisionEngine {
             state,
             untracked_positions: HashMap::new(),
             recent_failed_buys: HashMap::new(),
+            recent_ignored_mints: HashMap::new(),
             state_path,
         }
+    }
+
+    /// Registrar BUY ignorado/skipped (rate-limit, exposure, etc.) - TTL 60 min
+    pub fn record_ignored_mint(&mut self, mint: &str, reason: &str) {
+        self.recent_ignored_mints.insert(
+            mint.to_string(),
+            IgnoredMintEntry { ts: now_ts(), reason: reason.to_string() },
+        );
+    }
+
+    fn cleanup_recent_ignored_mints(&mut self) {
+        let now = now_ts();
+        self.recent_ignored_mints.retain(|_, e| now - e.ts < IGNORED_MINT_TTL_SECS);
     }
 
     /// Registrar BUY fallido (para no marcar orphan si llega SELL del líder)
@@ -603,8 +627,10 @@ impl DecisionEngine {
         }
         
         // Caso 4: Ni posición ni pending ni untracked
-        // Si hubo BUY fallido reciente -> no orphan (solo cooldown)
+        // Si hubo BUY fallido O ignorado reciente -> no orphan (solo cooldown)
         self.cleanup_recent_failed_buys();
+        self.cleanup_recent_ignored_mints();
+
         if let Some(failed) = self.recent_failed_buys.get(&s.mint) {
             if now - failed.ts < FAILED_BUY_TTL_SECS {
                 self.state.cooldown_blacklist.insert(
@@ -625,7 +651,37 @@ impl DecisionEngine {
             }
         }
 
-        // Caso 5: Real orphan
+        if let Some(ignored) = self.recent_ignored_mints.get(&s.mint) {
+            if now - ignored.ts < IGNORED_MINT_TTL_SECS {
+                self.state.cooldown_blacklist.insert(
+                    s.mint.clone(),
+                    CooldownEntry {
+                        reason: format!("ignored_buy_recent: {}", ignored.reason),
+                        until_ts: now + self.risk.cooldown_secs,
+                    },
+                );
+                self.save_state();
+                println!(
+                    "ℹ️ [SKIP] SELL sin posición pero BUY ignorado hace {}min -> cooldown (no orphan) | mint={}",
+                    (now - ignored.ts) / 60, &s.mint[..8.min(s.mint.len())]
+                );
+                return Action::Skip {
+                    reason: format!("recent_ignored_buy ({})", ignored.reason),
+                };
+            }
+        }
+
+        // Caso 5: Real orphan - log diagnóstico
+        let untracked_bal = self.untracked_positions.get(&s.mint).copied().unwrap_or(0);
+        println!(
+            "ℹ️ [SELL_NO_POS] mint={} full={} | failed_buy={} ignored={} untracked_bal={} -> ORPHAN",
+            &s.mint[..8.min(s.mint.len())],
+            s.mint,
+            self.recent_failed_buys.contains_key(&s.mint),
+            self.recent_ignored_mints.contains_key(&s.mint),
+            untracked_bal
+        );
+
         self.state.orphan_sells.insert(
             s.mint.clone(),
             OrphanSell {

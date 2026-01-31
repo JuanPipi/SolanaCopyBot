@@ -252,8 +252,12 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             
-                            Action::Skip { .. } => {
-                                // Ya se logueó en el engine
+                            Action::Skip { reason } => {
+                                if matches!(signal.side, crate::signals::Side::Buy) {
+                                    if !reason.contains("Ya hay posición") && !reason.contains("Ya hay pending") {
+                                        engine.record_ignored_mint(&signal.mint, &reason);
+                                    }
+                                }
                             }
                         }
                     }
