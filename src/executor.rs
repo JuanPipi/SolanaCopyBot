@@ -243,8 +243,21 @@ impl Executor {
         
         // Send and confirm
         println!("📤 [EXEC] Sending swap transaction...");
-        let sig = self.rpc_client.send_and_confirm_transaction(&signed_tx).await
-            .map_err(|e| anyhow!("Send failed: {}", e))?;
+        let sig = match self.rpc_client.send_and_confirm_transaction(&signed_tx).await {
+            Ok(s) => s,
+            Err(e) => {
+                // Si falla, simular para obtener los logs completos
+                if let Ok(sim) = self.rpc_client.simulate_transaction(&signed_tx).await {
+                    if let Some(logs) = sim.value.logs {
+                        eprintln!("   [SIM_LOGS] {} mensajes:", logs.len());
+                        for (i, line) in logs.iter().enumerate() {
+                            eprintln!("      [{}] {}", i + 1, line);
+                        }
+                    }
+                }
+                return Err(anyhow!("Send failed: {}", e));
+            }
+        };
         
         metrics.mark_send_done();
 
