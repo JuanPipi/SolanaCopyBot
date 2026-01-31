@@ -31,12 +31,15 @@ use tokio::sync::Mutex;
 async fn main() -> anyhow::Result<()> {
     let cfg = Config::load();
 
-    // Check for --test-jito flag
     let args: Vec<String> = std::env::args().collect();
     let test_jito = args.iter().any(|a| a == "--test-jito");
+    let sell_all = args.iter().any(|a| a == "--sell-all");
 
     if test_jito {
         return run_jito_test(&cfg).await;
+    }
+    if sell_all {
+        return run_sell_all(&cfg).await;
     }
 
     println!("🚀 Bot iniciado");
@@ -389,5 +392,92 @@ async fn run_jito_test(cfg: &Config) -> anyhow::Result<()> {
         println!("\n✅ Pipeline verificado. Podés usar el bot con confianza.");
     }
 
+    Ok(())
+}
+
+/// Vende todos los tokens a SOL y resetea state (--sell-all)
+async fn run_sell_all(cfg: &Config) -> anyhow::Result<()> {
+    println!("═══════════════════════════════════════════════════════");
+    println!("🔥 SELL ALL - Liquidar todo a SOL");
+    println!("═══════════════════════════════════════════════════════");
+
+    let keypair_path = cfg.keypair_path.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("KEYPAIR_PATH not set in .env"))?;
+
+    let risk = RiskConfig {
+        min_trade_sol: 0.005,
+        max_trade_sol: 0.01,
+        k_leader_scale: 0.005,
+        min_leader_sol_delta: 0.10,
+        exposure_cap_sol: 1.0,
+        reserve_sol: 0.01,
+        total_capital_sol: 1.0,
+        min_buy_interval_secs: 0,
+        cooldown_secs: 0,
+        max_hold_secs: 0,
+        reconcile_untracked_sell: true,
+    };
+
+    let exec_config = ExecutorConfig {
+        rpc_url: cfg.helius_http.clone(),
+        dry_run: false,
+        jito_enabled: cfg.jito_enabled(),
+        jito_url: cfg.jito_url.clone(),
+        jito_auth: cfg.jito_auth.clone(),
+        jito_tip_lamports: cfg.jito_tip_lamports,
+        compute_units: 200_000,
+        priority_fee_micro_lamports: 1_000,
+        keypair_path: Some(keypair_path.clone()),
+        jupiter_api_key: cfg.jupiter_api_key.clone(),
+        slippage_bps: 500, // 5% para liquidación
+        reserve_sol: risk.reserve_sol,
+    };
+
+    let mut executor = Executor::new(exec_config);
+    let owner = executor.owner_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("No keypair loaded"))?;
+
+    println!("🔑 Wallet: {}", owner);
+
+    let balances = executor.get_all_token_balances(&owner).await?;
+    let to_sell: Vec<_> = balances.into_iter()
+        .filter(|(mint, bal)| *mint != "So11111111111111111111111111111111111111112" && *bal > 0)
+        .collect();
+
+    if to_sell.is_empty() {
+        println!("✅ No hay tokens para vender (solo SOL)");
+    } else {
+        println!("📋 Tokens a vender: {}", to_sell.len());
+        for (mint, bal) in &to_sell {
+            println!("   └─ {} | balance={}", &mint[..8.min(mint.len())], bal);
+        }
+
+        for (mint, _) in &to_sell {
+            println!("\n🔄 Vendiendo {}...", &mint[..8.min(mint.len())]);
+            match executor.execute_sell(mint, "sell_all").await {
+                Ok(r) => println!("   ✅ Vendido | ~{:.6} SOL", r.sol_received),
+                Err(e) => eprintln!("   ⚠️ Falló: {}", e),
+            }
+            sleep(Duration::from_secs(2)).await; // pausa entre ventas
+        }
+    }
+
+    let rpc = RpcClient::new(cfg.helius_http.clone());
+    let final_bal = rpc.get_balance(&owner).await?;
+    println!("\n💰 Balance final: {:.6} SOL", final_bal as f64 / 1e9);
+
+    let state_path = "state.json";
+    let empty = serde_json::json!({
+        "pending_buys": {},
+        "open_positions": {},
+        "orphan_sells": {},
+        "cooldown_blacklist": {},
+        "last_processed_ts": 0,
+        "last_buy_ts": 0
+    });
+    std::fs::write(state_path, serde_json::to_string_pretty(&empty).unwrap_or_default())?;
+    println!("📂 state.json reseteado");
+
+    println!("\n✅ Listo para empezar de 0");
     Ok(())
 }
