@@ -323,13 +323,15 @@ impl DecisionEngine {
             self.record_failed_buy(mint, &record_reason_short);
             println!("📝 [ENGINE] failed_buy recorded | mint={} | reason={}", &mint[..8.min(mint.len())], record_reason_short);
 
-            // Cooldown según tipo de fallo (invalid_mint lo maneja main con add_invalid_mint_cooldown)
-            let (cooldown_secs, cooldown_reason) = if record_reason == "quote_no_route" {
-                (2 * 60, "no_route") // 2 min (Jupiter sin ruta: retry antes por si hay liquidez)
-            } else {
-                (30, "pending_failed") // 30s default
-            };
+            // No cooldown para no_route: intentar de nuevo cada vez (por si hay liquidez)
+            if record_reason == "quote_no_route" {
+                self.save_state();
+                println!("❌ [ENGINE] Pending CANCELADO | mint={} | reason={}", &mint[..8.min(mint.len())], record_reason_short);
+                return;
+            }
 
+            // Cooldown para otros fallos
+            let (cooldown_secs, cooldown_reason) = (30, "pending_failed");
             self.state.cooldown_blacklist.insert(
                 mint.to_string(),
                 CooldownEntry {
@@ -508,8 +510,14 @@ impl DecisionEngine {
             return Action::Skip { reason };
         }
 
-        // 5. Check cooldown blacklist
-        if let Some(entry) = self.state.cooldown_blacklist.get(&s.mint) {
+        // 5. Check cooldown blacklist (no_route se ignora: intentar cada vez)
+        let is_no_route = self.state.cooldown_blacklist.get(&s.mint)
+            .map(|e| e.reason.contains("no_route"))
+            .unwrap_or(false);
+        if is_no_route {
+            self.state.cooldown_blacklist.remove(&s.mint);
+            self.save_state();
+        } else if let Some(entry) = self.state.cooldown_blacklist.get(&s.mint) {
             if now < entry.until_ts {
                 let reason = format!(
                     "Mint en cooldown ({}) -> SKIP | mint={}",
