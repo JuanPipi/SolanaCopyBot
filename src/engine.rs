@@ -591,6 +591,18 @@ impl DecisionEngine {
 
     fn on_sell(&mut self, s: TradeSignal) -> Action {
         let now = now_ts();
+
+// Guard: si el mint está en cooldown, no spammear ORPHAN/SELL_NO_POS
+if let Some(entry) = self.state.cooldown_blacklist.get(&s.mint) {
+    if now < entry.until_ts {
+        println!(
+            "ℹ️ [SKIP] SELL en cooldown ({}) -> skip | mint={}",
+            entry.reason,
+            &s.mint[..8.min(s.mint.len())]
+        );
+        return Action::Skip { reason: format!("cooldown_sell ({})", entry.reason) };
+    }
+}
         
         // Caso 1: Posición abierta confirmada -> vender
         if self.state.open_positions.contains_key(&s.mint) {

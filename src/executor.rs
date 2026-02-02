@@ -281,47 +281,56 @@ impl Executor {
         let signed_tx = signed_tx_opt.ok_or_else(|| last_err)?;
         metrics.mark_build_done();
         
-        // Send and confirm (retry con fallback params si "too large")
-        println!("📤 [EXEC] Sending swap transaction...");
-        let sig = match self.rpc_client.send_and_confirm_transaction(&signed_tx).await {
-            Ok(s) => s,
-            Err(e) => {
-                let err_str = e.to_string();
-                let is_too_large = err_str.contains("too large") || err_str.contains("1688") || err_str.contains("1644") || err_str.contains("1232");
-                if is_too_large {
-                    println!("   ⚡ [RETRY] Tx too large, requoting con onlyDirectRoutes...");
-                    let fallback = JupiterClient::fallback_quote_params();
-                    let swap_result = jupiter.quote_and_build(
-                        mints::WSOL,
-                        mint,
-                        amount_lamports,
-                        &payer.pubkey(),
-                        Some(slippage_bps),
-                        Some(50_000),
-                        Some(&fallback),
-                    ).await.map_err(|e| anyhow!("Requote failed: {}", e))?;
-                    let retry_tx = jupiter.sign_swap_tx(swap_result, payer)
-                        .map_err(|e| anyhow!("Failed to sign: {}", e))?;
-                    self.rpc_client.send_and_confirm_transaction(&retry_tx).await
-                        .map_err(|e| anyhow!("Send failed (after requote): {}", e))?
-                } else {
-                    // Si falla, simular para obtener los logs completos
-                    if let Ok(sim) = self.rpc_client.simulate_transaction(&signed_tx).await {
-                        if let Some(logs) = sim.value.logs {
-                            eprintln!("   [SIM_LOGS] {} mensajes:", logs.len());
-                            for (i, line) in logs.iter().enumerate() {
-                                eprintln!("      [{}] {}", i + 1, line);
-                            }
-                        }
+        // Send (rápido) y confirm (medible) con fallback si la tx es demasiado grande
+println!("📤 [EXEC] Sending swap transaction...");
+let sig = match self.rpc_client.send_transaction(&signed_tx).await {
+    Ok(s) => s,
+    Err(e) => {
+        let err_str = e.to_string();
+        let is_too_large = err_str.contains("too large") || err_str.contains("1688") || err_str.contains("1644") || err_str.contains("1232");
+        if is_too_large {
+            println!("   ⚡ [RETRY] Tx too large, requoting con onlyDirectRoutes...");
+            let fallback = JupiterClient::fallback_quote_params();
+            let swap_result = jupiter.quote_and_build(
+                mints::WSOL,
+                mint,
+                amount_lamports,
+                &payer.pubkey(),
+                Some(slippage_bps),
+                Some(50_000),
+                Some(&fallback),
+            ).await.map_err(|e| anyhow!("Requote failed: {}", e))?;
+            let retry_tx = jupiter.sign_swap_tx(swap_result, payer)
+                .map_err(|e| anyhow!("Failed to sign: {}", e))?;
+            self.rpc_client.send_transaction(&retry_tx).await
+                .map_err(|e| anyhow!("Send failed (after requote): {}", e))?
+        } else {
+            // Si falla, simular para obtener logs completos
+            if let Ok(sim) = self.rpc_client.simulate_transaction(&signed_tx).await {
+                if let Some(logs) = sim.value.logs {
+                    eprintln!("   [SIM_LOGS] {} mensajes:", logs.len());
+                    for (i, line) in logs.iter().enumerate() {
+                        eprintln!("      [{}] {}", i + 1, line);
                     }
-                    return Err(anyhow!("Send failed: {}", e));
                 }
             }
-        };
-        
-        metrics.mark_send_done();
+            return Err(anyhow!("Send failed: {}", e));
+        }
+    }
+};
 
-        // CRITICAL: Verificar tokens recibidos
+metrics.mark_send_done();
+
+// Confirmación real on-chain (esto hace que confirm_ms sea real)
+println!("⏳ [EXEC] Esperando confirmación on-chain...");
+match self.broadcaster.confirm_transaction(&sig).await {
+    Ok(true) => {}
+    Ok(false) => return Err(anyhow!("Tx not confirmed within timeout (sig={})", sig)),
+    Err(e) => return Err(anyhow!("Confirm failed: {} (sig={})", e, sig)),
+}
+metrics.mark_confirm_done();
+
+// CRITICAL: Verificar tokens recibidos
         // 1) Primero por postTokenBalances de la tx (ultra robusto, no depende del indexado)
         println!("⏳ [EXEC] Verificando balance...");
         sleep(Duration::from_millis(300)).await;
@@ -332,7 +341,9 @@ impl Executor {
                     println!("   ✓ [TX] postTokenBalances confirma {} tokens", amt);
                     amt
                 } else {
-                    metrics.mark_confirm_done();
+                    // confirm_ms ya mide confirmación on-chain
+            // (skip mark_confirm_done)
+            
                     let m = metrics.finalize(false, Some("No tokens in postTokenBalances".to_string()));
                     m.log("BUY", mint);
                     return Err(anyhow!("BUY tx confirmada pero postTokenBalances=0 (sig={})", sig));
@@ -352,13 +363,17 @@ impl Executor {
                 eprintln!("   [DIAG] balance=0 | mint={} | token_program={} | ata={}", 
                     &mint[..8.min(mint.len())], token_program, ata);
             }
-            metrics.mark_confirm_done();
+            // confirm_ms ya mide confirmación on-chain
+            // (skip mark_confirm_done)
+            
             let m = metrics.finalize(false, Some("No tokens received".to_string()));
             m.log("BUY", mint);
             return Err(anyhow!("BUY tx confirmed but no tokens received (sig={})", sig));
         }
 
-        metrics.mark_confirm_done();
+        // confirm_ms ya mide confirmación on-chain
+            // (skip mark_confirm_done)
+            
         
         println!("✅ [EXEC] BUY VERIFIED | sig={} | balance={} tokens", sig, token_balance);
         let m = metrics.finalize(true, None);
@@ -481,32 +496,44 @@ impl Executor {
         metrics.mark_build_done();
         
         println!("📤 [EXEC] Sending sell transaction...");
-        let sig = match self.rpc_client.send_and_confirm_transaction(&signed_tx).await {
-            Ok(s) => s,
-            Err(e) => {
-                let err_str = e.to_string();
-                let is_too_large = err_str.contains("too large") || err_str.contains("1688") || err_str.contains("1644") || err_str.contains("1232");
-                if is_too_large {
-                    println!("   ⚡ [RETRY] Tx too large, requoting con onlyDirectRoutes...");
-                    let fallback = JupiterClient::fallback_quote_params();
-                    let swap_result = jupiter.quote_and_build(
-                        mint,
-                        mints::WSOL,
-                        token_balance,
-                        &payer.pubkey(),
-                        Some(slippage_bps),
-                        Some(50_000),
-                        Some(&fallback),
-                    ).await.map_err(|e| anyhow!("Requote failed: {}", e))?;
-                    let retry_tx = jupiter.sign_swap_tx(swap_result, payer)
-                        .map_err(|e| anyhow!("Failed to sign: {}", e))?;
-                    self.rpc_client.send_and_confirm_transaction(&retry_tx).await
-                        .map_err(|e| anyhow!("Send failed (after requote): {}", e))?
-                } else {
-                    return Err(anyhow!("Send failed: {}", e));
-                }
-            }
-        };
+let sig = match self.rpc_client.send_transaction(&signed_tx).await {
+    Ok(s) => s,
+    Err(e) => {
+        let err_str = e.to_string();
+        let is_too_large = err_str.contains("too large") || err_str.contains("1688") || err_str.contains("1644") || err_str.contains("1232");
+        if is_too_large {
+            println!("   ⚡ [RETRY] Tx too large, requoting con onlyDirectRoutes...");
+            let fallback = JupiterClient::fallback_quote_params();
+            let swap_result = jupiter.quote_and_build(
+                mint,
+                mints::WSOL,
+                token_balance,
+                &payer.pubkey(),
+                Some(slippage_bps),
+                Some(50_000),
+                Some(&fallback),
+            ).await.map_err(|e| anyhow!("Requote failed: {}", e))?;
+            let retry_tx = jupiter.sign_swap_tx(swap_result, payer)
+                .map_err(|e| anyhow!("Failed to sign: {}", e))?;
+            self.rpc_client.send_transaction(&retry_tx).await
+                .map_err(|e| anyhow!("Send failed (after requote): {}", e))?
+        } else {
+            return Err(anyhow!("Send failed: {}", e));
+        }
+    }
+};
+
+metrics.mark_send_done();
+
+// Confirmación real on-chain (confirm_ms ya no queda en 0)
+println!("⏳ [EXEC] Esperando confirmación on-chain...");
+match self.broadcaster.confirm_transaction(&sig).await {
+    Ok(true) => {}
+    Ok(false) => return Err(anyhow!("Tx not confirmed within timeout (sig={})", sig)),
+    Err(e) => return Err(anyhow!("Confirm failed: {} (sig={})", e, sig)),
+}
+metrics.mark_confirm_done();
+
         
         metrics.mark_send_done();
         metrics.mark_confirm_done();

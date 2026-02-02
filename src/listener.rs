@@ -166,9 +166,10 @@ pub async fn listen_wallets(
     txq: mpsc::Sender<(String, String)>,
 ) -> Result<()> {
     let mut retry_delay = Duration::from_secs(1);
-    let max_retry_delay = Duration::from_secs(60);
+    let max_retry_delay = Duration::from_secs(15);
     
     loop {
+        let session_started = std::time::Instant::now();
         match handle_websocket_session(wss_url, rpc_http, wallets, txq.clone()).await {
             Ok(_) => {
                 // No debería llegar aquí, pero por si acaso
@@ -177,6 +178,10 @@ pub async fn listen_wallets(
             }
             Err(e) => {
                 println!("❌ Error en la conexión WebSocket: {}", e);
+                // Si la sesión estuvo viva un buen rato, reseteamos backoff para reconectar rápido.
+                if session_started.elapsed() > Duration::from_secs(30) {
+                    retry_delay = Duration::from_secs(1);
+                }
                 println!("🔄 Reintentando conexión en {} segundos...", retry_delay.as_secs());
                 
                 sleep(retry_delay).await;
