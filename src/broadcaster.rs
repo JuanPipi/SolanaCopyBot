@@ -304,48 +304,42 @@ impl Broadcaster {
     }
 
     /// Confirma que la transacción llegó a la cadena.
-///
-/// IMPORTANTE: `send_transaction` (RPC) devuelve rápido, pero el *commitment* tarda.
-/// Esta función hace polling con backoff corto para medir bien el tiempo de confirmación.
-pub async fn confirm_transaction(&self, sig: &Signature) -> Result<bool> {
-    use tokio::time::{sleep, Duration, Instant};
-    use solana_client::rpc_response::RpcSignatureResult;
-    use solana_client::rpc_config::RpcSignatureStatusConfig;
+    ///
+    /// IMPORTANTE: `send_transaction` (RPC) devuelve rápido, pero el *commitment* tarda.
+    /// Esta función hace polling con backoff corto para medir bien el tiempo de confirmación.
+    pub async fn confirm_transaction(&self, sig: &Signature) -> Result<bool> {
+        use tokio::time::{sleep, Duration, Instant};
 
-    let start = Instant::now();
-    let timeout = Duration::from_secs(20); // suficiente para mainnet sin quedar colgado
-    let mut delay = Duration::from_millis(250);
+        let start = Instant::now();
+        let timeout = Duration::from_secs(20); // suficiente para mainnet sin quedar colgado
+        let mut delay = Duration::from_millis(250);
 
-    loop {
-        // get_signature_statuses devuelve Option en el mismo orden
-        let statuses = self.rpc_client
-            .get_signature_statuses_with_config(
-                &[*sig],
-                RpcSignatureStatusConfig { search_transaction_history: true }
-            )
-            .await
-            .map_err(|e| anyhow!("Confirm poll failed: {}", e))?;
+        loop {
+            let statuses = self.rpc_client
+                .get_signature_statuses(&[*sig])
+                .await
+                .map_err(|e| anyhow!("Confirm poll failed: {}", e))?;
 
-        let st = statuses.value.get(0).cloned().flatten();
+            let st = statuses.value.get(0).cloned().flatten();
 
-        if let Some(st) = st {
-            if let Some(err) = st.err {
-                return Err(anyhow!("Tx failed: {:?}", err));
+            if let Some(st) = st {
+                if let Some(err) = st.err {
+                    return Err(anyhow!("Tx failed: {:?}", err));
+                }
+                // Consideramos confirmada si tiene confirmation_status (processed/confirmed/finalized)
+                // Para copy-trading, "confirmed" suele ser suficiente.
+                if st.confirmation_status.is_some() {
+                    return Ok(true);
+                }
             }
-            // Consideramos confirmada si tiene confirmation_status (processed/confirmed/finalized)
-            // Para copy-trading, "confirmed" suele ser suficiente.
-            if st.confirmation_status.is_some() {
-                return Ok(true);
+
+            if start.elapsed() >= timeout {
+                return Ok(false);
             }
-        }
 
-        if start.elapsed() >= timeout {
-            return Ok(false);
+            sleep(delay).await;
+            // Backoff suave, cap 1s
+            delay = std::cmp::min(delay * 2, Duration::from_secs(1));
         }
-
-        sleep(delay).await;
-        // Backoff suave, cap 1s
-        delay = std::cmp::min(delay * 2, Duration::from_secs(1));
     }
 }
-
