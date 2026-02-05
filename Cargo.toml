@@ -2,6 +2,7 @@
 name = "solana_copy_bot"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }

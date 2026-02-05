@@ -42,9 +42,9 @@ async fn main() -> anyhow::Result<()> {
         return run_sell_all(&cfg).await;
     }
 
+    let app_version = env!("CARGO_PKG_VERSION");
     let git_sha = option_env!("GIT_SHA").unwrap_or("unknown");
-    let build_ts = option_env!("BUILD_TS").unwrap_or("unknown");
-    println!("🤖 Bot iniciado | version={} | build={}", git_sha, build_ts);
+    println!("bot iniciado | version={} | commit={}", app_version, git_sha);
     println!("═══════════════════════════════════════════════════════");
 
     // Canal compartido para todas las transacciones (WS + poller)
