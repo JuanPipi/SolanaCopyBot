@@ -15,17 +15,29 @@ use tokio::time::sleep;
 
 use crate::broadcaster::{BroadcastConfig, BroadcastResult, Broadcaster};
 use crate::engine::Action;
+use crate::error_classifier::{classify_error, ErrorCategory};
+use crate::execution_config::ExecutionConfig;
 use crate::jupiter::{JupiterClient, sol_to_lamports, mints};
 use crate::metrics::MetricsTracker;
 use crate::prepared::{PreparedSwapCache, SwapPreparer};
 use crate::tx_builder::{SwapInstructionBuilder, TxBuilder, TxBuilderConfig};
 
-/// Resultado de un BUY exitoso (con MI signature, no del lider)
+/// Estado del resultado de ejecución (para estado consistente)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecuteStatus {
+    Confirmed,
+    Failed,
+    Missed,         // liquidez/slippage - no retry
+    UnknownTimeout, // timeout confirmación - reconciliar luego
+}
+
+/// Resultado de un BUY (con status para confirm_position)
 #[derive(Debug, Clone)]
 pub struct BuyExecutionResult {
     pub my_sig: String,
     pub my_token_balance: u64,
     pub my_sol_spent: f64,
+    pub status: ExecuteStatus,
 }
 
 /// Resultado de un SELL exitoso
@@ -34,6 +46,7 @@ pub struct SellExecutionResult {
     pub my_sig: String,
     pub tokens_sold: u64,
     pub sol_received: f64,
+    pub status: ExecuteStatus,
 }
 
 pub struct ExecutorConfig {
@@ -48,8 +61,8 @@ pub struct ExecutorConfig {
     pub keypair_path: Option<String>,
     pub jupiter_api_key: Option<String>,
     pub slippage_bps: u16,
-    /// Reserva SOL intocable (para balance guard)
     pub reserve_sol: f64,
+    pub execution_config: ExecutionConfig,
 }
 
 impl Default for ExecutorConfig {
@@ -65,8 +78,9 @@ impl Default for ExecutorConfig {
             priority_fee_micro_lamports: 1_000,
             keypair_path: None,
             jupiter_api_key: None,
-            slippage_bps: 100, // 1% default
+            slippage_bps: 100,
             reserve_sol: 0.05,
+            execution_config: ExecutionConfig::default(),
         }
     }
 }
@@ -156,65 +170,101 @@ impl Executor {
         self.payer.as_ref().map(|p| p.pubkey())
     }
 
-    /// Ejecuta BUY con slippage dinámico (retry si falla por 0x1771)
+    /// Ejecuta BUY: SNIPER = 1 intento, RETRY = múltiples por slippage
     pub async fn execute_buy(&mut self, mint: &str, sol_amount: f64) -> Result<BuyExecutionResult> {
-        // DRY RUN: simular éxito
         if self.config.dry_run {
             println!("🏜️ [DRY_RUN] BUY simulado | mint={} | sol={:.6}", &mint[..8.min(mint.len())], sol_amount);
             return Ok(BuyExecutionResult {
                 my_sig: format!("dry_run_{}", &mint[..8.min(mint.len())]),
                 my_token_balance: 1_000_000,
                 my_sol_spent: sol_amount,
+                status: ExecuteStatus::Confirmed,
             });
         }
 
-        // Balance guard ANTES de intentar (evita insufficient lamports)
         let payer = self.payer.as_ref().ok_or_else(|| anyhow!("No keypair loaded"))?;
         let mint_pubkey: Pubkey = mint.parse().map_err(|_| anyhow!("Invalid mint: {}", mint))?;
         if let Err(e) = self.check_buy_balance(payer.pubkey(), sol_amount, &mint_pubkey).await {
             return Err(e);
         }
 
-        // Slippage levels para retry: 300 -> 450 -> 600 -> 800 bps
-        let slippage_levels = [
-            self.config.slippage_bps,                    // Default (300)
-            self.config.slippage_bps + 150,              // 450
-            self.config.slippage_bps + 300,              // 600
-            self.config.slippage_bps + 500,              // 800
-        ];
+        let is_sniper = self.config.execution_config.is_sniper();
+        let slippage = if is_sniper {
+            self.config.execution_config.max_slippage_bps_sniper
+        } else {
+            self.config.slippage_bps
+        };
+
+        let max_attempts = if is_sniper && self.config.execution_config.sniper_single_shot {
+            1
+        } else {
+            let levels = [
+                slippage,
+                slippage + 150,
+                slippage + 300,
+                slippage + 500,
+            ];
+            levels.len()
+        };
 
         let mut last_error = anyhow!("No attempts made");
+        let slippage_levels: Vec<u16> = if is_sniper {
+            vec![slippage]
+        } else {
+            vec![
+                self.config.slippage_bps,
+                self.config.slippage_bps + 150,
+                self.config.slippage_bps + 300,
+                self.config.slippage_bps + 500,
+            ]
+        };
 
-        for (attempt, &slippage) in slippage_levels.iter().enumerate() {
+        for (attempt, &slippage_bps) in slippage_levels.iter().take(max_attempts).enumerate() {
             println!(
-                "🔄 [EXEC] BUY attempt {}/{} | mint={} | sol={:.4} | slippage={}bps",
-                attempt + 1, slippage_levels.len(), &mint[..8.min(mint.len())], sol_amount, slippage
+                "{} [EXEC] BUY attempt {}/{} | mint={} | sol={:.4} | slippage={}bps",
+                if is_sniper { "🎯" } else { "🔄" },
+                attempt + 1,
+                max_attempts,
+                &mint[..8.min(mint.len())],
+                sol_amount,
+                slippage_bps
             );
 
-            match self.try_buy_with_slippage(mint, sol_amount, slippage).await {
+            match self.try_buy_with_slippage(mint, sol_amount, slippage_bps).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     let err_str = e.to_string();
                     last_error = e;
+                    let cat = classify_error(&err_str);
 
-                    // 0x1771 = slippage exceeded en pump.fun
-                    // Si es error de slippage y quedan intentos, retry
-                    if err_str.contains("0x1771") && attempt < slippage_levels.len() - 1 {
-                        println!(
-                            "   ⚡ [RETRY] Slippage exceeded, retrying con {}bps...",
-                            slippage_levels[attempt + 1]
-                        );
-                        continue;
+                    match cat {
+                        ErrorCategory::Miss => {
+                            println!("   ❌ [SNIPER] MISS (liquidez/slippage) - no retry");
+                            return Err(anyhow!("MISS_LIQUIDITY: {}", err_str));
+                        }
+                        ErrorCategory::InsufficientFunds => {
+                            println!("   ⛔ [GUARD] Fondos insuficientes - hard stop");
+                            return Err(anyhow!("insufficient_sol: {}", err_str));
+                        }
+                        ErrorCategory::InfraFail if is_sniper => {
+                            println!("   ❌ [SNIPER] INFRA_FAIL - no retry");
+                            return Err(anyhow!("INFRA_FAIL: {}", err_str));
+                        }
+                        _ if is_sniper => {
+                            return Err(anyhow!("{}", err_str));
+                        }
+                        _ => {
+                            if err_str.contains("0x1771") && attempt < slippage_levels.len() - 1 {
+                                println!("   ⚡ [RETRY] Slippage -> {}bps", slippage_levels[attempt + 1]);
+                                continue;
+                            }
+                            if err_str.contains("Blockhash not found") && attempt < slippage_levels.len() - 1 {
+                                println!("   ⚡ [RETRY] Blockhash stale");
+                                continue;
+                            }
+                            break;
+                        }
                     }
-
-                    // Blockhash not found -> rebuild needed, pero no retry infinito
-                    if err_str.contains("Blockhash not found") && attempt < slippage_levels.len() - 1 {
-                        println!("   ⚡ [RETRY] Blockhash stale, rebuilding tx...");
-                        continue;
-                    }
-
-                    // Otro error -> no retry
-                    break;
                 }
             }
         }
@@ -321,14 +371,25 @@ let sig = match self.rpc_client.send_transaction(&signed_tx).await {
 
 metrics.mark_send_done();
 
-// Confirmación real on-chain (esto hace que confirm_ms sea real)
-println!("⏳ [EXEC] Esperando confirmación on-chain...");
-match self.broadcaster.confirm_transaction(&sig).await {
-    Ok(true) => {}
-    Ok(false) => return Err(anyhow!("Tx not confirmed within timeout (sig={})", sig)),
-    Err(e) => return Err(anyhow!("Confirm failed: {} (sig={})", e, sig)),
-}
-metrics.mark_confirm_done();
+        let timeout_secs = self.config.execution_config.confirm_timeout_secs;
+        println!("⏳ [EXEC] Esperando confirmación on-chain ({}s)...", timeout_secs);
+        match self.broadcaster.confirm_transaction(&sig).await {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("⚠️ [EXEC] Tx no confirmada en timeout - pasar a reconciliación | sig={}", sig);
+                metrics.mark_confirm_done();
+                let m = metrics.finalize(false, Some("confirm_timeout".to_string()));
+                m.log("BUY", mint);
+                return Ok(BuyExecutionResult {
+                    my_sig: sig.to_string(),
+                    my_token_balance: 0,
+                    my_sol_spent: sol_amount,
+                    status: ExecuteStatus::UnknownTimeout,
+                });
+            }
+            Err(e) => return Err(anyhow!("Confirm failed: {} (sig={})", e, sig)),
+        };
+        metrics.mark_confirm_done();
 
 // CRITICAL: Verificar tokens recibidos
         // 1) Primero por postTokenBalances de la tx (ultra robusto, no depende del indexado)
@@ -383,6 +444,7 @@ metrics.mark_confirm_done();
             my_sig: sig.to_string(),
             my_token_balance: token_balance,
             my_sol_spent: sol_amount,
+            status: ExecuteStatus::Confirmed,
         })
     }
 
@@ -397,7 +459,6 @@ metrics.mark_confirm_done();
 
         metrics.mark_detect_done();
 
-        // DRY RUN
         if self.config.dry_run {
             println!("🏜️ [DRY_RUN] SELL simulado | mint={}", &mint[..8.min(mint.len())]);
             metrics.mark_build_done();
@@ -409,10 +470,16 @@ metrics.mark_confirm_done();
                 my_sig: format!("dry_run_sell_{}", &mint[..8.min(mint.len())]),
                 tokens_sold: 1_000_000,
                 sol_received: 0.01,
+                status: ExecuteStatus::Confirmed,
             });
         }
 
-        // Slippage levels para retry (igual que BUY): 300 -> 450 -> 600 -> 800 bps
+        let is_sniper = self.config.execution_config.is_sniper();
+        let max_attempts = if is_sniper && self.config.execution_config.sniper_single_shot {
+            1
+        } else {
+            4
+        };
         let slippage_levels = [
             self.config.slippage_bps,
             self.config.slippage_bps + 150,
@@ -421,12 +488,22 @@ metrics.mark_confirm_done();
         ];
 
         let mut last_error = anyhow!("No attempts made");
-        for (attempt, &slippage) in slippage_levels.iter().enumerate() {
+        let slippage_base = if is_sniper {
+            self.config.execution_config.max_slippage_bps_sniper
+        } else {
+            self.config.slippage_bps
+        };
+        for (attempt, &slippage) in slippage_levels.iter().take(max_attempts).enumerate() {
+            let slip = if is_sniper { slippage_base } else { slippage };
             println!(
-                "🔄 [EXEC] SELL attempt {}/{} | mint={} | slippage={}bps",
-                attempt + 1, slippage_levels.len(), &mint[..8.min(mint.len())], slippage
+                "{} [EXEC] SELL attempt {}/{} | mint={} | slippage={}bps",
+                if is_sniper { "🎯" } else { "🔄" },
+                attempt + 1,
+                max_attempts,
+                &mint[..8.min(mint.len())],
+                slip
             );
-            match self.try_sell_with_slippage(mint, reason, slippage).await {
+            match self.try_sell_with_slippage(mint, reason, slip).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     let err_str = e.to_string();
@@ -435,9 +512,8 @@ metrics.mark_confirm_done();
                     if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("insufficient") || err_str.contains("balance=0") {
                         break;
                     }
-                    if err_str.contains("0x1771") && attempt < slippage_levels.len() - 1 {
-                        let next_slippage = slippage_levels[attempt + 1];
-                        println!("   ⚡ [RETRY] sell slippage -> {}bps...", next_slippage);
+                    if err_str.contains("0x1771") && attempt < max_attempts - 1 && !is_sniper {
+                        println!("   ⚡ [RETRY] sell slippage -> {}bps...", slippage_levels.get(attempt + 1).copied().unwrap_or(slip));
                         continue;
                     }
                     if err_str.contains("Blockhash not found") && attempt < slippage_levels.len() - 1 {
@@ -546,6 +622,7 @@ metrics.mark_confirm_done();
             my_sig: sig.to_string(),
             tokens_sold: token_balance,
             sol_received: expected_sol,
+            status: ExecuteStatus::Confirmed,
         })
     }
 
@@ -853,6 +930,46 @@ metrics.mark_confirm_done();
     /// Limpia el cache de swaps preparados
     pub fn cleanup_cache(&mut self) {
         self.swap_cache.cleanup();
+    }
+
+    /// Reconciliar acción pendiente (UnknownTimeout): verificar si tx confirmó y tokens recibidos
+    pub async fn reconcile_pending_action(
+        &self,
+        engine: &mut crate::engine::DecisionEngine,
+        mint: &str,
+        sig_str: &str,
+        intended_sol: f64,
+        leader_delta: f64,
+    ) -> bool {
+        let payer = match self.payer.as_ref() {
+            Some(p) => p.pubkey(),
+            None => return false,
+        };
+        let sig: Signature = match sig_str.parse() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if !self.broadcaster.confirm_transaction(&sig).await.unwrap_or(false) {
+            return false;
+        }
+        let mint_pubkey: Pubkey = match mint.parse() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let balance = match self.verify_tokens_from_tx_with_retry(&sig, &payer, mint, 3).await {
+            Ok(Some(b)) if b > 0 => b,
+            _ => self.get_token_balance_with_retry(&payer, &mint_pubkey, 3).await.unwrap_or(0),
+        };
+        if balance > 0 {
+            if engine.pending_actions.contains_key(mint) {
+                engine.confirm_position_from_reconcile(mint, sig_str, balance, intended_sol, leader_delta);
+            } else {
+                engine.confirm_position(mint, sig_str, balance, intended_sol);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Test de bundle: envía dummy tx + tip por Jito

@@ -1,12 +1,15 @@
 mod config;
-mod listener;
 mod decoder;
-mod signals;
 mod engine;
+mod error_classifier;
+mod execution_config;
 mod csv_logger;
+mod listener;
 mod metrics;
 mod broadcaster;
 mod prepared;
+mod signals;
+mod signal_dedupe;
 mod tx_builder;
 mod executor;
 mod jupiter;
@@ -19,7 +22,9 @@ use tokio::sync::mpsc;
 use crate::decoder::analyze_transaction_async;
 use crate::engine::{Action, DecisionEngine, RiskConfig};
 use crate::csv_logger::CsvLogger;
-use crate::executor::{Executor, ExecutorConfig};
+use crate::executor::{Executor, ExecutorConfig, ExecuteStatus};
+use crate::execution_config::ExecutionConfig;
+use crate::signal_dedupe::{signal_id, DedupeDecision, SignalDedupe};
 use crate::broadcaster::{BroadcastConfig, Broadcaster};
 use crate::tx_builder::{TxBuilder, TxBuilderConfig};
 use tokio::time::{sleep, Duration};
@@ -84,20 +89,35 @@ async fn main() -> anyhow::Result<()> {
     println!("   - cooldown: {}s | max_hold: {}h", risk.cooldown_secs, risk.max_hold_secs / 3600);
     println!("═══════════════════════════════════════════════════════");
 
-    // Executor config (ejecución REAL activada)
+    let execution_config = ExecutionConfig::load_from_env(cfg.jito_tip_lamports);
+    println!("📋 Execution Config: mode={:?} | sniper_single_shot={} | max_slippage_sniper={}bps",
+        execution_config.execution_mode,
+        execution_config.sniper_single_shot,
+        execution_config.max_slippage_bps_sniper,
+    );
+
     let exec_config = ExecutorConfig {
         rpc_url: cfg.helius_http.clone(),
-        dry_run: false, // EJECUCIÓN REAL ACTIVADA
+        dry_run: false,
         jito_enabled: cfg.jito_enabled(),
         jito_url: cfg.jito_url.clone(),
         jito_auth: cfg.jito_auth.clone(),
-        jito_tip_lamports: cfg.jito_tip_lamports,
-        compute_units: 200_000,
-        priority_fee_micro_lamports: 1_000,
+        jito_tip_lamports: if execution_config.is_sniper() {
+            execution_config.jito_tip_lamports_sniper
+        } else {
+            cfg.jito_tip_lamports
+        },
+        compute_units: execution_config.compute_unit_limit,
+        priority_fee_micro_lamports: execution_config.compute_unit_price_microlamports,
         keypair_path: cfg.keypair_path.clone(),
         jupiter_api_key: cfg.jupiter_api_key.clone(),
-        slippage_bps: 300, // 3% slippage (pump tokens volatiles)
+        slippage_bps: if execution_config.is_sniper() {
+            execution_config.max_slippage_bps_sniper
+        } else {
+            300
+        },
         reserve_sol: risk.reserve_sol,
+        execution_config: execution_config.clone(),
     };
 
     println!("🎮 Executor Config:");
@@ -118,10 +138,13 @@ async fn main() -> anyhow::Result<()> {
     let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let seen_worker = seen.clone();
 
+    let cooldown_miss_ms = execution_config.cooldown_miss_ms;
     tokio::spawn(async move {
         let mut engine = DecisionEngine::new(risk, "state.json");
         let mut executor = Executor::new(exec_config);
+        let mut signal_dedupe = SignalDedupe::new(cooldown_miss_ms);
         let mut csv_logger = CsvLogger::new("signals.csv").ok();
+        let mut msg_count: u64 = 0;
 
         println!("✅ Engine y Executor inicializados");
         println!("✅ RpcClient compartido activo");
@@ -161,12 +184,24 @@ async fn main() -> anyhow::Result<()> {
 
             match analyze_transaction_async(&rpc_client_worker, &wallet_clean, &sig).await {
                 Ok(Some(signal)) => {
-                    // Log CSV con source
                     if let Some(logger) = csv_logger.as_mut() {
                         logger.log_signal(&signal, &source);
                     }
 
-                    // Decision Engine (Quality Gate + Sizing Dinámico)
+                    // Dedupe por signal_id
+                    let sid = signal_id(&signal);
+                    match signal_dedupe.should_process(&sid) {
+                        DedupeDecision::AlreadyProcessed => continue,
+                        DedupeDecision::MissCooldown(reason) => {
+                            println!("⏭️ [DEDUPE] Miss cooldown | {}", reason);
+                            continue;
+                        }
+                        DedupeDecision::Inflight => continue,
+                        DedupeDecision::Process => {
+                            signal_dedupe.mark_inflight(&sid);
+                        }
+                    }
+
                     let actions = engine.handle_signal(signal.clone());
 
                     // Ejecutar TODAS las acciones
@@ -182,23 +217,44 @@ async fn main() -> anyhow::Result<()> {
 
                         // Ejecutar acción con el nuevo ciclo de vida
                         match action {
-                            Action::Buy { mint, sol_amount, leader_delta: _, leader_sig: _ } => {
-                                // pending_buy ya fue agregado por el engine
+                            Action::Buy { mint, sol_amount, leader_delta, leader_sig: _ } => {
                                 match executor.execute_buy(&mint, sol_amount).await {
                                     Ok(result) => {
-                                        // ÉXITO: confirmar posición con MI signature
-                                        engine.confirm_position(
-                                            &mint,
-                                            &result.my_sig,
-                                            result.my_token_balance,
-                                            result.my_sol_spent,
-                                        );
+                                        match result.status {
+                                            ExecuteStatus::Confirmed => {
+                                                engine.confirm_position(
+                                                    &mint,
+                                                    &result.my_sig,
+                                                    result.my_token_balance,
+                                                    result.my_sol_spent,
+                                                );
+                                                signal_dedupe.mark_processed(&sid);
+                                            }
+                                            ExecuteStatus::UnknownTimeout => {
+                                                engine.add_pending_action_for_reconcile(
+                                                    &mint,
+                                                    &result.my_sig,
+                                                    sol_amount,
+                                                    leader_delta,
+                                                );
+                                                signal_dedupe.clear_inflight(&sid);
+                                            }
+                                            _ => {
+                                                engine.cancel_pending_buy(&mint, "unknown_status");
+                                                signal_dedupe.clear_inflight(&sid);
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         let err_str = e.to_string();
-                                        engine.cancel_pending_buy(&mint, &err_str); // incluye record_failed_buy
+                                        engine.cancel_pending_buy(&mint, &err_str);
+                                        if err_str.contains("MISS_LIQUIDITY") || err_str.contains("quote_no_route") {
+                                            signal_dedupe.mark_missed(&sid, &err_str);
+                                        } else {
+                                            signal_dedupe.clear_inflight(&sid);
+                                        }
                                         if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("Mint invalid") {
-                                            engine.add_invalid_mint_cooldown(&mint, 60 * 60); // 60 min
+                                            engine.add_invalid_mint_cooldown(&mint, 60 * 60);
                                         }
                                         if err_str.contains("insufficient_sol") {
                                             println!("   ⛔ [GUARD] No se intentó swap (balance insuficiente)");
@@ -209,13 +265,18 @@ async fn main() -> anyhow::Result<()> {
                             
                             Action::Sell { mint, reason } => {
                                 match executor.execute_sell(&mint, &reason).await {
-                                    Ok(_result) => {
-                                        // ÉXITO: remover posición (open o untracked)
-                                        engine.remove_position(&mint);
-                                        engine.untracked_positions.remove(&mint);
+                                    Ok(result) => {
+                                        if result.status == ExecuteStatus::Confirmed {
+                                            engine.remove_position(&mint);
+                                            engine.untracked_positions.remove(&mint);
+                                            signal_dedupe.mark_processed(&sid);
+                                        } else {
+                                            signal_dedupe.clear_inflight(&sid);
+                                        }
                                     }
                                     Err(e) => {
                                         eprintln!("⚠️ [MAIN] SELL failed for {}: {}", &mint[..8.min(mint.len())], e);
+                                        signal_dedupe.clear_inflight(&sid);
                                         let err_str = e.to_string();
                                         if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("Mint invalid") {
                                             engine.add_invalid_mint_cooldown(&mint, 60 * 60); // 60 min
@@ -271,8 +332,24 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => eprintln!("⚠️ Error analizando {}: {}", sig, e),
             }
 
-            // Limpiar cache periódicamente
+            msg_count += 1;
             executor.cleanup_cache();
+
+            // Reconciliación cada 30 mensajes
+            if msg_count % 30 == 0 && !engine.pending_actions.is_empty() {
+                let to_reconcile: Vec<_> = engine.pending_actions.keys().cloned().collect();
+                for mint in to_reconcile {
+                    if let Some(pa) = engine.pending_actions.get(&mint) {
+                        let sig = pa.signature.clone();
+                        let sol = pa.intended_sol;
+                        let leader_delta = pa.leader_delta;
+                        if executor.reconcile_pending_action(&mut engine, &mint, &sig, sol, leader_delta).await {
+                            engine.pending_actions.remove(&mint);
+                            println!("✅ [RECONCILE] Posición confirmada | mint={}", &mint[..8.min(mint.len())]);
+                        }
+                    }
+                }
+            }
         }
     });
 
@@ -431,8 +508,9 @@ async fn run_sell_all(cfg: &Config) -> anyhow::Result<()> {
         priority_fee_micro_lamports: 1_000,
         keypair_path: Some(keypair_path.clone()),
         jupiter_api_key: cfg.jupiter_api_key.clone(),
-        slippage_bps: 500, // 5% para liquidación
+        slippage_bps: 500,
         reserve_sol: risk.reserve_sol,
+        execution_config: ExecutionConfig::default(),
     };
 
     let mut executor = Executor::new(exec_config);

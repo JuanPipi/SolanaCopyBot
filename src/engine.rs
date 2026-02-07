@@ -102,6 +102,16 @@ pub struct IgnoredMintEntry {
     pub reason: String,
 }
 
+/// Acción pendiente de reconciliación (UnknownTimeout - guardar firma para verificar luego)
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    pub mint: String,
+    pub signature: String,
+    pub intended_sol: f64,
+    pub leader_delta: f64,
+    pub started_at: i64,
+}
+
 const FAILED_BUY_TTL_SECS: i64 = 120;   // 2 min (buy falló, sell viene enseguida)
 const IGNORED_MINT_TTL_SECS: i64 = 3600; // 60 min (no copiamos, líder puede vender después)
 
@@ -114,6 +124,8 @@ pub struct DecisionEngine {
     pub recent_failed_buys: HashMap<String, FailedBuyEntry>,
     /// BUYs ignorados/skipped (mint -> {ts, reason}), TTL 60 min
     pub recent_ignored_mints: HashMap<String, IgnoredMintEntry>,
+    /// Acciones con UnknownTimeout (mint -> PendingAction) para reconciliar
+    pub pending_actions: HashMap<String, PendingAction>,
     state_path: String,
 }
 
@@ -176,6 +188,7 @@ impl DecisionEngine {
             untracked_positions: HashMap::new(),
             recent_failed_buys: HashMap::new(),
             recent_ignored_mints: HashMap::new(),
+            pending_actions: HashMap::new(),
             state_path,
         }
     }
@@ -262,7 +275,63 @@ impl DecisionEngine {
         println!("📝 [ENGINE] Pending BUY agregado | mint={} | sol={:.4}", &mint[..8.min(mint.len())], intended_sol);
     }
 
-    /// Confirmar posición (llamar SOLO si executor verificó balance > 0)
+    /// Agregar a pending_actions para reconciliación (status=UnknownTimeout)
+    pub fn add_pending_action_for_reconcile(
+        &mut self,
+        mint: &str,
+        my_sig: &str,
+        intended_sol: f64,
+        leader_delta: f64,
+    ) {
+        if let Some(pending) = self.state.pending_buys.remove(mint) {
+            self.pending_actions.insert(
+                mint.to_string(),
+                PendingAction {
+                    mint: mint.to_string(),
+                    signature: my_sig.to_string(),
+                    intended_sol,
+                    leader_delta: pending.leader_delta,
+                    started_at: pending.started_at,
+                },
+            );
+            println!(
+                "⏳ [ENGINE] Pending action para reconciliación | mint={} | sig={}",
+                &mint[..8.min(mint.len())],
+                &my_sig[..12.min(my_sig.len())]
+            );
+        }
+    }
+
+    /// Confirmar posición desde reconciliación (sin pending_buy - ya fue movido a pending_actions)
+    pub fn confirm_position_from_reconcile(
+        &mut self,
+        mint: &str,
+        my_sig: &str,
+        my_token_balance: u64,
+        my_sol_spent: f64,
+        leader_delta: f64,
+    ) {
+        if let Some(pa) = self.pending_actions.remove(mint) {
+            let pos = Position {
+                mint: mint.to_string(),
+                opened_sig: my_sig.to_string(),
+                opened_ts: now_ts(),
+                leader_sol_delta_at_open: pa.leader_delta,
+                my_trade_sol: my_sol_spent,
+                my_token_balance,
+            };
+            self.state.open_positions.insert(mint.to_string(), pos);
+            self.save_state();
+            println!(
+                "✅ [RECONCILE] Posición CONFIRMADA | mint={} | my_sig={} | tokens={}",
+                &mint[..8.min(mint.len())],
+                &my_sig[..12.min(my_sig.len())],
+                my_token_balance
+            );
+        }
+    }
+
+    /// Confirmar posición (llamar SOLO si executor verificó balance > 0 y status=Confirmed)
     pub fn confirm_position(&mut self, mint: &str, my_sig: &str, my_token_balance: u64, my_sol_spent: f64) {
         if let Some(pending) = self.state.pending_buys.remove(mint) {
             let pos = Position {

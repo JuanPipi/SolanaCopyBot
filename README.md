@@ -15,6 +15,7 @@ A high-performance copy trading bot for Solana written in Rust. Monitors wallet 
 - **State persistence** (survives restarts)
 - **CSV logging** for signals and decisions
 - **Dry-run mode** for testing
+- **SNIPER mode** (default): single-shot execution, maximum inclusion probability, no retries on liquidity/slippage
 
 ## Architecture
 
@@ -109,6 +110,28 @@ my_trade = clamp(k * |leader_sol_delta|, min_trade, max_trade)
 Example with k=0.035:
 - Leader trades 2 SOL → You trade 0.07 SOL
 - Leader trades 5 SOL → You trade 0.10 SOL (capped)
+
+## Sniper Mode (Default)
+
+El bot usa por defecto `EXECUTION_MODE=sniper`:
+
+- **1 intento** por señal: ultra rápido, máxima probabilidad de inclusión
+- **Sin reintentos** por liquidez insuficiente, slippage o price impact
+- **Estado consistente**: NO se guarda posición hasta confirmación on-chain real
+- **Dedupe**: `signal_id` determinístico evita doble envío
+- **Reconciliación**: txs con timeout se guardan en `pending_actions` y se verifican periódicamente
+
+### Variables de entorno (Sniper)
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| EXECUTION_MODE | sniper | `sniper` o `retry` |
+| SNIPER_SINGLE_SHOT | true | Un solo intento por señal |
+| MAX_SLIPPAGE_BPS_SNIPER | 1500 | Slippage máximo (15%) en sniper |
+| JITO_TIP_LAMPORTS_SNIPER | 20000 | Tip Jito para sniper |
+| COMPUTE_UNIT_LIMIT | 1400000 | Límite de compute units |
+| COOLDOWN_MISS_MS | 30000 | Cooldown tras MISS (30s) para no reintentar misma señal |
+| CONFIRM_TIMEOUT_SECS | 10 | Timeout de confirmación on-chain |
 
 ## Security Notes
 
