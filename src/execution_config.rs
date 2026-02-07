@@ -77,6 +77,10 @@ pub struct ExecutionConfig {
     pub scale_factor: f64,
     pub cooldown_miss_ms: u64,
     pub confirm_timeout_secs: u64,
+    pub max_leader_lag_ms: u64,
+    pub min_trade_sol_sniper: f64,
+    pub min_trade_sol: f64,
+    pub max_trade_sol: f64,
 }
 
 impl Default for ExecutionConfig {
@@ -95,8 +99,12 @@ impl Default for ExecutionConfig {
             quote_max_age_ms: 300,
             amount_scale_on_low_liquidity: false,
             scale_factor: 0.5,
-            cooldown_miss_ms: 30_000, // 30s
+            cooldown_miss_ms: 30_000,
             confirm_timeout_secs: 10,
+            max_leader_lag_ms: 1200,
+            min_trade_sol_sniper: 0.01,
+            min_trade_sol: 0.02,
+            max_trade_sol: 0.07,
         }
     }
 }
@@ -180,6 +188,26 @@ impl ExecutionConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
 
+        let max_leader_lag_ms = env::var("MAX_LEADER_LAG_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1200);
+
+        let min_trade_sol_sniper = env::var("MIN_TRADE_SOL_SNIPER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.01);
+
+        let min_trade_sol = env::var("MIN_TRADE_SOL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.02);
+
+        let max_trade_sol = env::var("MAX_TRADE_SOL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.07);
+
         Self {
             execution_mode,
             sniper_single_shot,
@@ -196,6 +224,10 @@ impl ExecutionConfig {
             scale_factor,
             cooldown_miss_ms,
             confirm_timeout_secs,
+            max_leader_lag_ms,
+            min_trade_sol_sniper,
+            min_trade_sol,
+            max_trade_sol,
         }
     }
 

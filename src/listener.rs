@@ -158,38 +158,59 @@ pub async fn handle_websocket_session(
     }
 }
 
-/// Función principal con reconexión automática permanente
+/// Jitter: suma 0..=25% del delay
+fn add_jitter_ms(delay_ms: u64) -> u64 {
+    use rand::Rng;
+    let jitter = rand::thread_rng().gen_range(0..=(delay_ms / 4));
+    delay_ms + jitter
+}
+
+/// Función principal con reconexión: backoff exponencial 1s,2s,4s,8s... max 30s + jitter
 pub async fn listen_wallets(
     wss_url: &str,
     rpc_http: &str,
     wallets: &[String],
     txq: mpsc::Sender<(String, String)>,
 ) -> Result<()> {
-    let mut retry_delay = Duration::from_secs(1);
-    let max_retry_delay = Duration::from_secs(15);
-    
+    let mut delay_secs: u64 = 1;
+    let max_delay_secs = 30u64;
+    let mut reconnect_count = 0u64;
+
     loop {
         let session_started = std::time::Instant::now();
         match handle_websocket_session(wss_url, rpc_http, wallets, txq.clone()).await {
             Ok(_) => {
-                // No debería llegar aquí, pero por si acaso
                 println!("ℹ️ Sesión terminó normalmente");
                 break;
             }
             Err(e) => {
-                println!("❌ Error en la conexión WebSocket: {}", e);
-                // Si la sesión estuvo viva un buen rato, reseteamos backoff para reconectar rápido.
-                if session_started.elapsed() > Duration::from_secs(30) {
-                    retry_delay = Duration::from_secs(1);
+                let err_str = e.to_string();
+                let is_connection_reset = err_str.contains("Connection reset")
+                    || err_str.contains("without closing handshake")
+                    || err_str.contains("Connection reset by peer");
+
+                if is_connection_reset {
+                    println!("🔌 Conexión cerrada (reset/handshake) - reconectando...");
+                } else {
+                    println!("❌ Error WebSocket: {}", e);
                 }
-                println!("🔄 Reintentando conexión en {} segundos...", retry_delay.as_secs());
-                
-                sleep(retry_delay).await;
-                
-                // Backoff exponencial con límite máximo
-                retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
-                
-                println!("🔄 Intentando reconectar...");
+
+                reconnect_count += 1;
+
+                if session_started.elapsed() > Duration::from_secs(30) {
+                    delay_secs = 1;
+                }
+
+                let delay_ms = add_jitter_ms(delay_secs * 1000);
+                println!(
+                    "🔄 Reintento #{} en {}ms (backoff {}s + jitter)...",
+                    reconnect_count, delay_ms, delay_secs
+                );
+
+                sleep(Duration::from_millis(delay_ms)).await;
+
+                delay_secs = std::cmp::min(delay_secs * 2, max_delay_secs);
+                println!("🔄 Reconectando...");
             }
         }
     }

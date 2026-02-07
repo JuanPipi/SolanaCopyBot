@@ -135,10 +135,25 @@ fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
     if x < lo { lo } else if x > hi { hi } else { x }
 }
 
-fn compute_my_trade_sol(risk: &RiskConfig, leader_sol_delta: f64) -> f64 {
+/// Retorna Some(sol) o None si MISS_RISK (no se puede bump a min)
+fn compute_my_trade_sol(risk: &RiskConfig, state: &EngineState, leader_sol_delta: f64) -> Option<f64> {
     let l = leader_sol_delta.abs();
     let raw = risk.k_leader_scale * l;
-    clamp(raw, risk.min_trade_sol, risk.max_trade_sol)
+    let exposure = current_exposure_sol(state);
+
+    let my_trade = if raw < risk.min_trade_sol {
+        if exposure + risk.min_trade_sol <= risk.exposure_cap_sol
+            && risk.total_capital_sol - exposure - risk.min_trade_sol >= risk.reserve_sol
+        {
+            risk.min_trade_sol
+        } else {
+            return None;
+        }
+    } else {
+        clamp(raw, risk.min_trade_sol, risk.max_trade_sol)
+    };
+
+    Some(my_trade)
 }
 
 /// Exposure total = open_positions + pending_buys
@@ -609,8 +624,15 @@ impl DecisionEngine {
             }
         }
 
-        // 7. Calcular sizing dinámico
-        let my_trade_sol = compute_my_trade_sol(&self.risk, s.leader_sol_delta);
+        // 7. Calcular sizing dinámico (MISS_RISK si no se puede bump a min)
+        let my_trade_sol = match compute_my_trade_sol(&self.risk, &self.state, s.leader_sol_delta) {
+            Some(sol) => sol,
+            None => {
+                let reason = "MISS_RISK: computed < MIN_TRADE_SOL and risk constraints disallow bump".to_string();
+                println!("⚠️ [RISK] {}", reason);
+                return Action::Skip { reason };
+            }
+        };
         let exposure = current_exposure_sol(&self.state);
 
         // 8. Check exposure cap

@@ -2,14 +2,18 @@ mod config;
 mod decoder;
 mod engine;
 mod error_classifier;
+mod exec_outcome;
 mod execution_config;
 mod csv_logger;
 mod listener;
 mod metrics;
 mod broadcaster;
+mod missed_logger;
 mod prepared;
 mod signals;
 mod signal_dedupe;
+mod leader_fees;
+mod stats;
 mod tx_builder;
 mod executor;
 mod jupiter;
@@ -22,10 +26,12 @@ use tokio::sync::mpsc;
 use crate::decoder::analyze_transaction_async;
 use crate::engine::{Action, DecisionEngine, RiskConfig};
 use crate::csv_logger::CsvLogger;
+use crate::exec_outcome::{ExecOutcome, ExecStage, MissedReason};
 use crate::executor::{Executor, ExecutorConfig, ExecuteStatus};
 use crate::execution_config::ExecutionConfig;
 use crate::signal_dedupe::{signal_id, DedupeDecision, SignalDedupe};
 use crate::broadcaster::{BroadcastConfig, Broadcaster};
+use crate::stats::SniperStats;
 use crate::tx_builder::{TxBuilder, TxBuilderConfig};
 use tokio::time::{sleep, Duration};
 use std::collections::HashSet;
@@ -55,14 +61,17 @@ async fn main() -> anyhow::Result<()> {
     // Canal compartido para todas las transacciones (WS + poller)
     let (txq, mut rxq) = mpsc::channel::<(String, String)>(200);
 
-    // Risk config con SIZING DINÁMICO
-    // MODO TEST SEGURO: trades chicos para validar pipeline
-    // - max 0.01 SOL por trade
-    // - exposure cap bajo
+    let execution_config = ExecutionConfig::load_from_env(cfg.jito_tip_lamports);
+
+    let (min_trade, max_trade) = if execution_config.is_sniper() {
+        (execution_config.min_trade_sol, execution_config.max_trade_sol)
+    } else {
+        (0.005, 0.01)
+    };
+
     let risk = RiskConfig {
-        // Sizing dinámico - MODO TEST
-        min_trade_sol: 0.005,        // mínimo por trade (test)
-        max_trade_sol: 0.01,         // máximo por trade (test)
+        min_trade_sol: min_trade,
+        max_trade_sol: max_trade,
         k_leader_scale: 0.005,       // my_trade = k * abs(leader_delta)
         
         // Quality Gate
@@ -88,14 +97,13 @@ async fn main() -> anyhow::Result<()> {
     println!("   - min_buy_interval: {}s", risk.min_buy_interval_secs);
     println!("   - cooldown: {}s | max_hold: {}h", risk.cooldown_secs, risk.max_hold_secs / 3600);
     println!("═══════════════════════════════════════════════════════");
-
-    let execution_config = ExecutionConfig::load_from_env(cfg.jito_tip_lamports);
     println!("📋 Execution Config: mode={:?} | sniper_single_shot={} | max_slippage_sniper={}bps",
         execution_config.execution_mode,
         execution_config.sniper_single_shot,
         execution_config.max_slippage_bps_sniper,
     );
 
+    let stats = Arc::new(SniperStats::new());
     let exec_config = ExecutorConfig {
         rpc_url: cfg.helius_http.clone(),
         dry_run: false,
@@ -118,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         },
         reserve_sol: risk.reserve_sol,
         execution_config: execution_config.clone(),
+        stats: Some(stats.clone()),
     };
 
     println!("🎮 Executor Config:");
@@ -139,15 +148,20 @@ async fn main() -> anyhow::Result<()> {
     let seen_worker = seen.clone();
 
     let cooldown_miss_ms = execution_config.cooldown_miss_ms;
+    let stats_worker = stats.clone();
     tokio::spawn(async move {
         let mut engine = DecisionEngine::new(risk, "state.json");
         let mut executor = Executor::new(exec_config);
         let mut signal_dedupe = SignalDedupe::new(cooldown_miss_ms);
         let mut csv_logger = CsvLogger::new("signals.csv").ok();
+        let missed_logger = missed_logger::MissedLogger::new("missed_trades.jsonl").ok();
+        let max_leader_lag_ms = execution_config.max_leader_lag_ms;
         let mut msg_count: u64 = 0;
 
         println!("✅ Engine y Executor inicializados");
         println!("✅ RpcClient compartido activo");
+
+        executor.warmup().await;
 
         // Reconciliación: detectar posiciones fuera del state
         if let Some(owner) = executor.owner_pubkey() {
@@ -193,16 +207,34 @@ async fn main() -> anyhow::Result<()> {
                     match signal_dedupe.should_process(&sid) {
                         DedupeDecision::AlreadyProcessed => continue,
                         DedupeDecision::MissCooldown(reason) => {
+                            stats_worker.inc_miss_cooldown();
                             println!("⏭️ [DEDUPE] Miss cooldown | {}", reason);
                             continue;
                         }
                         DedupeDecision::Inflight => continue,
                         DedupeDecision::Process => {
                             signal_dedupe.mark_inflight(&sid);
+                            stats_worker.inc_signals_seen();
+                            msg_count += 1;
+                            if msg_count % 20 == 0 {
+                                stats_worker.print_summary();
+                            }
                         }
                     }
 
                     let actions = engine.handle_signal(signal.clone());
+
+                    for action in &actions {
+                        if let Action::Skip { reason } = action {
+                            if reason.contains("MISS_RISK") {
+                                stats_worker.inc_miss_risk();
+                            } else if reason.contains("cooldown") || reason.contains("Cooldown") || reason.contains("DEDUPE") {
+                                stats_worker.inc_miss_cooldown();
+                            } else if !reason.is_empty() {
+                                stats_worker.inc_miss_other();
+                            }
+                        }
+                    }
 
                     // Ejecutar TODAS las acciones
                     for action in actions {
@@ -215,48 +247,68 @@ async fn main() -> anyhow::Result<()> {
                             logger.log_decision(signal_ref, &action);
                         }
 
-                        // Ejecutar acción con el nuevo ciclo de vida
                         match action {
-                            Action::Buy { mint, sol_amount, leader_delta, leader_sig: _ } => {
-                                match executor.execute_buy(&mint, sol_amount).await {
-                                    Ok(result) => {
-                                        match result.status {
-                                            ExecuteStatus::Confirmed => {
-                                                engine.confirm_position(
-                                                    &mint,
-                                                    &result.my_sig,
-                                                    result.my_token_balance,
-                                                    result.my_sol_spent,
-                                                );
-                                                signal_dedupe.mark_processed(&sid);
-                                            }
-                                            ExecuteStatus::UnknownTimeout => {
-                                                engine.add_pending_action_for_reconcile(
-                                                    &mint,
-                                                    &result.my_sig,
-                                                    sol_amount,
-                                                    leader_delta,
-                                                );
-                                                signal_dedupe.clear_inflight(&sid);
-                                            }
-                                            _ => {
-                                                engine.cancel_pending_buy(&mint, "unknown_status");
-                                                signal_dedupe.clear_inflight(&sid);
-                                            }
-                                        }
+                            Action::Buy { mint, sol_amount, leader_delta, leader_sig } => {
+                                // Guard: MAX_LEADER_LAG_MS
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let leader_ts_ms = (signal.ts as u64) * 1000;
+                                if now_ms.saturating_sub(leader_ts_ms) > max_leader_lag_ms {
+                                    stats_worker.inc_miss_other();
+                                    println!("   ❌ [SNIPER] MISS LatencyTooHigh | lag={}ms > max={}ms", now_ms.saturating_sub(leader_ts_ms), max_leader_lag_ms);
+                                    let outcome = ExecOutcome::Missed {
+                                        reason: MissedReason::LatencyTooHigh,
+                                        stage: ExecStage::Quote,
+                                        details: Some(format!("lag={}ms", now_ms.saturating_sub(leader_ts_ms))),
+                                        ts: chrono::Utc::now().timestamp(),
+                                    };
+                                    if let Some(ref ml) = missed_logger {
+                                        ml.log_outcome(&mint, Some(&leader_sig), leader_delta, sol_amount, &outcome);
                                     }
-                                    Err(e) => {
-                                        let err_str = e.to_string();
-                                        engine.cancel_pending_buy(&mint, &err_str);
-                                        if err_str.contains("MISS_LIQUIDITY") || err_str.contains("quote_no_route") {
-                                            signal_dedupe.mark_missed(&sid, &err_str);
+                                    engine.cancel_pending_buy(&mint, "latency_too_high");
+                                    signal_dedupe.mark_missed(&sid, "LatencyTooHigh");
+                                    continue;
+                                }
+
+                                leader_fees::fetch_and_log_leader_fees_spawn(
+                                    rpc_client_worker.clone(),
+                                    leader_sig.clone(),
+                                    execution_config.compute_unit_price_microlamports,
+                                );
+
+                                let outcome = executor.execute_buy(&mint, sol_amount).await;
+
+                                if let Some(ref ml) = missed_logger {
+                                    ml.log_outcome(&mint, Some(&leader_sig), leader_delta, sol_amount, &outcome);
+                                }
+
+                                match &outcome {
+                                    ExecOutcome::Filled { sig, out_amount, in_amount_sol, .. } => {
+                                        engine.confirm_position(&mint, sig, *out_amount, *in_amount_sol);
+                                        signal_dedupe.mark_processed(&sid);
+                                    }
+                                    ExecOutcome::Missed { reason, .. } => {
+                                        if matches!(reason, MissedReason::InsufficientLiquidity | MissedReason::NoRoute) {
+                                            stats_worker.inc_miss_liquidity();
                                         } else {
-                                            signal_dedupe.clear_inflight(&sid);
+                                            stats_worker.inc_miss_other();
                                         }
-                                        if err_str.contains("0x2") || err_str.contains("Invalid Mint") || err_str.contains("Mint invalid") {
+                                        engine.cancel_pending_buy(&mint, &format!("{:?}", reason));
+                                        signal_dedupe.mark_missed(&sid, &format!("{:?}", reason));
+                                        if format!("{:?}", reason).contains("Invalid") || format!("{:?}", reason).contains("0x2") {
                                             engine.add_invalid_mint_cooldown(&mint, 60 * 60);
                                         }
-                                        if err_str.contains("insufficient_sol") {
+                                    }
+                                    ExecOutcome::Failed { err, .. } => {
+                                        stats_worker.inc_miss_other();
+                                        engine.cancel_pending_buy(&mint, err);
+                                        signal_dedupe.clear_inflight(&sid);
+                                        if err.contains("0x2") || err.contains("Invalid Mint") || err.contains("Mint invalid") {
+                                            engine.add_invalid_mint_cooldown(&mint, 60 * 60);
+                                        }
+                                        if err.contains("insufficient") {
                                             println!("   ⛔ [GUARD] No se intentó swap (balance insuficiente)");
                                         }
                                     }
@@ -353,14 +405,19 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // WebSocket para todas las wallets
-    listener::listen_wallets(
-        &cfg.helius_wss,
-        &cfg.helius_http,
-        &cfg.wallets,
-        txq,
-    )
-    .await?;
+    // WebSocket para todas las wallets; stats al shutdown (Ctrl+C)
+    tokio::select! {
+        res = listener::listen_wallets(
+            &cfg.helius_wss,
+            &cfg.helius_http,
+            &cfg.wallets,
+            txq,
+        ) => res?,
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n📊 [SHUTDOWN] Stats:");
+            stats.print_summary();
+        }
+    }
 
     Ok(())
 }
@@ -511,6 +568,7 @@ async fn run_sell_all(cfg: &Config) -> anyhow::Result<()> {
         slippage_bps: 500,
         reserve_sol: risk.reserve_sol,
         execution_config: ExecutionConfig::default(),
+        stats: None,
     };
 
     let mut executor = Executor::new(exec_config);

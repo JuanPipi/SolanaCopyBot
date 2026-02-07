@@ -126,12 +126,42 @@ El bot usa por defecto `EXECUTION_MODE=sniper`:
 | Variable | Default | Descripción |
 |----------|---------|-------------|
 | EXECUTION_MODE | sniper | `sniper` o `retry` |
-| SNIPER_SINGLE_SHOT | true | Un solo intento por señal |
+| SNIPER_SINGLE_SHOT | true | Un solo intento por señal (sin reintentos) |
 | MAX_SLIPPAGE_BPS_SNIPER | 1500 | Slippage máximo (15%) en sniper |
 | JITO_TIP_LAMPORTS_SNIPER | 20000 | Tip Jito para sniper |
 | COMPUTE_UNIT_LIMIT | 1400000 | Límite de compute units |
-| COOLDOWN_MISS_MS | 30000 | Cooldown tras MISS (30s) para no reintentar misma señal |
+| COOLDOWN_MISS_MS | 30000 | Cooldown tras MISS (30s) |
 | CONFIRM_TIMEOUT_SECS | 10 | Timeout de confirmación on-chain |
+| MAX_LEADER_LAG_MS | 1200 | Lag máximo líder (ms) - Missed{LatencyTooHigh} si excede |
+| MIN_TRADE_SOL_SNIPER | 0.01 | Mínimo SOL por trade - Missed{AmountTooSmall} si menor |
+
+### ExecOutcome y missed_trades.jsonl
+
+- **Filled**: trade ejecutado y confirmado on-chain
+- **Missed**: NoRoute, InsufficientLiquidity, AmountTooSmall, LatencyTooHigh, QuoteExpired (no reintentar)
+- **Failed**: errores de infra (RPC, timeout) - no reintentar en sniper
+
+Se registra cada evento en `missed_trades.jsonl` (una línea JSON por evento).
+
+### Ejemplos de logs esperados
+
+**1. Filled (éxito)**
+```
+🎯 [SNIPER] BUY 1 intento | mint=AbC12345 | sol=0.0100 | slippage=1500bps
+   ✓ Quote: 10000000 lamports -> 500000 tokens
+✅ [SNIPER] FILLED | sig=3xYz... | balance=500000 tokens
+```
+
+**2. Missed NoRoute**
+```
+🎯 [SNIPER] BUY 1 intento | mint=GdWo7jwq | sol=0.0100 | slippage=1500bps
+   ❌ [SNIPER] MISS NoRoute | stage=Quote | Jupiter quote error: ...
+```
+
+**3. Missed LatencyTooHigh**
+```
+   ❌ [SNIPER] MISS LatencyTooHigh | lag=1500ms > max=1200ms
+```
 
 ## Security Notes
 

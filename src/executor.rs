@@ -16,29 +16,26 @@ use tokio::time::sleep;
 use crate::broadcaster::{BroadcastConfig, BroadcastResult, Broadcaster};
 use crate::engine::Action;
 use crate::error_classifier::{classify_error, ErrorCategory};
+use crate::exec_outcome::{ExecOutcome, ExecStage, MissedReason};
 use crate::execution_config::ExecutionConfig;
 use crate::jupiter::{JupiterClient, sol_to_lamports, mints};
 use crate::metrics::MetricsTracker;
 use crate::prepared::{PreparedSwapCache, SwapPreparer};
+use crate::stats::SniperStats;
 use crate::tx_builder::{SwapInstructionBuilder, TxBuilder, TxBuilderConfig};
+use solana_client::rpc_config::RpcSendTransactionConfig;
 
-/// Estado del resultado de ejecución (para estado consistente)
+/// Estado legado para compatibilidad con SELL
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecuteStatus {
     Confirmed,
     Failed,
-    Missed,         // liquidez/slippage - no retry
-    UnknownTimeout, // timeout confirmación - reconciliar luego
+    Missed,
+    UnknownTimeout,
 }
 
-/// Resultado de un BUY (con status para confirm_position)
-#[derive(Debug, Clone)]
-pub struct BuyExecutionResult {
-    pub my_sig: String,
-    pub my_token_balance: u64,
-    pub my_sol_spent: f64,
-    pub status: ExecuteStatus,
-}
+/// Resultado de un BUY: Filled / Missed / Failed
+pub type BuyResult = ExecOutcome;
 
 /// Resultado de un SELL exitoso
 #[derive(Debug, Clone)]
@@ -47,6 +44,34 @@ pub struct SellExecutionResult {
     pub tokens_sold: u64,
     pub sol_received: f64,
     pub status: ExecuteStatus,
+}
+
+fn now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Mapear error de Jupiter/quote a MissedReason
+fn map_quote_error_to_missed(err_str: &str) -> MissedReason {
+    let s = err_str.to_lowercase();
+    if s.contains("could_not_find") || s.contains("no route") || s.contains("no route found") {
+        MissedReason::NoRoute
+    } else if s.contains("insufficient liquidity") || s.contains("liquidity") || s.contains("0x1771") {
+        MissedReason::InsufficientLiquidity
+    } else if s.contains("amount too small") || s.contains("too small") {
+        MissedReason::AmountTooSmall
+    } else if s.contains("expired") || s.contains("stale") || s.contains("quote") {
+        MissedReason::QuoteExpired
+    } else if s.contains("0x2") || s.contains("invalid mint") || s.contains("tokenzqd") {
+        MissedReason::InsufficientLiquidity
+    } else {
+        MissedReason::NoRoute
+    }
+}
+
+/// Indica si el error de quote permite fallback a relaxed (NO_ROUTE / liquidity miss)
+fn is_liquidity_or_no_route_error(err_str: &str) -> bool {
+    let reason = map_quote_error_to_missed(err_str);
+    matches!(reason, MissedReason::NoRoute | MissedReason::InsufficientLiquidity)
 }
 
 pub struct ExecutorConfig {
@@ -63,6 +88,7 @@ pub struct ExecutorConfig {
     pub slippage_bps: u16,
     pub reserve_sol: f64,
     pub execution_config: ExecutionConfig,
+    pub stats: Option<std::sync::Arc<SniperStats>>,
 }
 
 impl Default for ExecutorConfig {
@@ -81,6 +107,7 @@ impl Default for ExecutorConfig {
             slippage_bps: 100,
             reserve_sol: 0.05,
             execution_config: ExecutionConfig::default(),
+            stats: None,
         }
     }
 }
@@ -94,6 +121,7 @@ pub struct Executor {
     swap_preparer: SwapPreparer,
     payer: Option<Keypair>,
     jupiter: Option<JupiterClient>,
+    stats: Option<Arc<SniperStats>>,
 }
 
 impl Executor {
@@ -153,6 +181,7 @@ impl Executor {
             None
         };
 
+        let stats = config.stats.clone();
         Self {
             config,
             rpc_client,
@@ -162,6 +191,30 @@ impl Executor {
             swap_preparer,
             payer,
             jupiter,
+            stats,
+        }
+    }
+
+    /// Warmup: blockhash, slot, dummy Jupiter quote (calienta RPC y Jupiter)
+    pub async fn warmup(&self) {
+        if let Ok((bh, slot)) = tokio::try_join!(
+            self.rpc_client.get_latest_blockhash(),
+            self.rpc_client.get_slot(),
+        ) {
+            println!("🔥 [WARMUP] RPC ready | blockhash={}.. slot={}", &bh.to_string()[..8.min(8)], slot);
+        }
+        if let Some(ref jup) = self.jupiter {
+            let params = JupiterClient::strict_quote_params();
+            let res = jup.get_quote(
+                mints::WSOL,
+                mints::USDC,
+                10_000_000, // 0.01 SOL
+                Some(100),
+                Some(&params),
+            ).await;
+            if res.is_ok() {
+                println!("🔥 [WARMUP] Jupiter ready (dummy quote OK)");
+            }
         }
     }
 
@@ -170,282 +223,320 @@ impl Executor {
         self.payer.as_ref().map(|p| p.pubkey())
     }
 
-    /// Ejecuta BUY: SNIPER = 1 intento, RETRY = múltiples por slippage
-    pub async fn execute_buy(&mut self, mint: &str, sol_amount: f64) -> Result<BuyExecutionResult> {
+    /// Ejecuta BUY: SNIPER = 1 intento (sin reintentos), RETRY = múltiples por slippage
+    pub async fn execute_buy(&mut self, mint: &str, sol_amount: f64) -> BuyResult {
+        let ts = now_ts();
+        let is_sniper = self.config.execution_config.is_sniper() && self.config.execution_config.sniper_single_shot;
+        if is_sniper {
+            if let Some(ref s) = self.stats {
+                s.inc_attempted_buys();
+            }
+        }
+
         if self.config.dry_run {
             println!("🏜️ [DRY_RUN] BUY simulado | mint={} | sol={:.6}", &mint[..8.min(mint.len())], sol_amount);
-            return Ok(BuyExecutionResult {
-                my_sig: format!("dry_run_{}", &mint[..8.min(mint.len())]),
-                my_token_balance: 1_000_000,
-                my_sol_spent: sol_amount,
-                status: ExecuteStatus::Confirmed,
-            });
+            return ExecOutcome::Filled {
+                sig: format!("dry_run_{}", &mint[..8.min(mint.len())]),
+                in_amount_sol: sol_amount,
+                out_amount: 1_000_000,
+                price_impact_bps: None,
+                ts,
+            };
         }
 
-        let payer = self.payer.as_ref().ok_or_else(|| anyhow!("No keypair loaded"))?;
-        let mint_pubkey: Pubkey = mint.parse().map_err(|_| anyhow!("Invalid mint: {}", mint))?;
-        if let Err(e) = self.check_buy_balance(payer.pubkey(), sol_amount, &mint_pubkey).await {
-            return Err(e);
+        let exec = &self.config.execution_config;
+
+        // min_trade_sol_sniper
+        if is_sniper && sol_amount < exec.min_trade_sol_sniper {
+            println!("   ❌ [SNIPER] MISS AmountTooSmall | my_sol={:.4} < min={:.4}", sol_amount, exec.min_trade_sol_sniper);
+            return ExecOutcome::Missed {
+                reason: MissedReason::AmountTooSmall,
+                stage: ExecStage::Quote,
+                details: Some(format!("sol={:.4} < min={:.4}", sol_amount, exec.min_trade_sol_sniper)),
+                ts,
+            };
         }
 
-        let is_sniper = self.config.execution_config.is_sniper();
-        let slippage = if is_sniper {
-            self.config.execution_config.max_slippage_bps_sniper
-        } else {
-            self.config.slippage_bps
-        };
-
-        let max_attempts = if is_sniper && self.config.execution_config.sniper_single_shot {
-            1
-        } else {
-            let levels = [
-                slippage,
-                slippage + 150,
-                slippage + 300,
-                slippage + 500,
-            ];
-            levels.len()
-        };
-
-        let mut last_error = anyhow!("No attempts made");
-        let slippage_levels: Vec<u16> = if is_sniper {
-            vec![slippage]
-        } else {
-            vec![
-                self.config.slippage_bps,
-                self.config.slippage_bps + 150,
-                self.config.slippage_bps + 300,
-                self.config.slippage_bps + 500,
-            ]
-        };
-
-        for (attempt, &slippage_bps) in slippage_levels.iter().take(max_attempts).enumerate() {
-            println!(
-                "{} [EXEC] BUY attempt {}/{} | mint={} | sol={:.4} | slippage={}bps",
-                if is_sniper { "🎯" } else { "🔄" },
-                attempt + 1,
-                max_attempts,
-                &mint[..8.min(mint.len())],
-                sol_amount,
-                slippage_bps
-            );
-
-            match self.try_buy_with_slippage(mint, sol_amount, slippage_bps).await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    let err_str = e.to_string();
-                    last_error = e;
-                    let cat = classify_error(&err_str);
-
-                    match cat {
-                        ErrorCategory::Miss => {
-                            println!("   ❌ [SNIPER] MISS (liquidez/slippage) - no retry");
-                            return Err(anyhow!("MISS_LIQUIDITY: {}", err_str));
-                        }
-                        ErrorCategory::InsufficientFunds => {
-                            println!("   ⛔ [GUARD] Fondos insuficientes - hard stop");
-                            return Err(anyhow!("insufficient_sol: {}", err_str));
-                        }
-                        ErrorCategory::InfraFail if is_sniper => {
-                            println!("   ❌ [SNIPER] INFRA_FAIL - no retry");
-                            return Err(anyhow!("INFRA_FAIL: {}", err_str));
-                        }
-                        _ if is_sniper => {
-                            return Err(anyhow!("{}", err_str));
-                        }
-                        _ => {
-                            if err_str.contains("0x1771") && attempt < slippage_levels.len() - 1 {
-                                println!("   ⚡ [RETRY] Slippage -> {}bps", slippage_levels[attempt + 1]);
-                                continue;
-                            }
-                            if err_str.contains("Blockhash not found") && attempt < slippage_levels.len() - 1 {
-                                println!("   ⚡ [RETRY] Blockhash stale");
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                }
+        let payer = match self.payer.as_ref() {
+            Some(p) => p,
+            None => {
+                return ExecOutcome::Failed {
+                    err: "No keypair loaded".to_string(),
+                    stage: ExecStage::Quote,
+                    ts,
+                };
             }
+        };
+        let mint_pubkey: Pubkey = match mint.parse() {
+            Ok(p) => p,
+            Err(_) => {
+                return ExecOutcome::Failed {
+                    err: format!("Invalid mint: {}", mint),
+                    stage: ExecStage::Quote,
+                    ts,
+                };
+            }
+        };
+
+        if let Err(e) = self.check_buy_balance(payer.pubkey(), sol_amount, &mint_pubkey).await {
+            return ExecOutcome::Failed {
+                err: e.to_string(),
+                stage: ExecStage::Quote,
+                ts,
+            };
         }
 
-        Err(last_error)
+        if is_sniper {
+            self.execute_buy_sniper(mint, sol_amount, ts).await
+        } else {
+            self.execute_buy_retry(mint, sol_amount, ts).await
+        }
     }
 
-    /// Intento de BUY con un slippage específico
-    async fn try_buy_with_slippage(&mut self, mint: &str, sol_amount: f64, slippage_bps: u16) -> Result<BuyExecutionResult> {
-        let mut metrics = MetricsTracker::new();
-        metrics.mark_detect_done();
+    /// SNIPER single-shot: 1 intento, sin reintentos
+    async fn execute_buy_sniper(&mut self, mint: &str, sol_amount: f64, ts: i64) -> BuyResult {
+        let slippage = self.config.execution_config.max_slippage_bps_sniper;
+        println!("🎯 [SNIPER] BUY 1 intento | mint={} | sol={:.4} | slippage={}bps", &mint[..8.min(mint.len())], sol_amount, slippage);
 
-        let payer = self.payer.as_ref()
-            .ok_or_else(|| anyhow!("No keypair loaded"))?;
-        let jupiter = self.jupiter.as_ref()
-            .ok_or_else(|| anyhow!("Jupiter client not available"))?;
+        match self.try_buy_once(mint, sol_amount, slippage, true).await {
+            Ok(outcome) => outcome,
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// RETRY mode: múltiples intentos por slippage
+    async fn execute_buy_retry(&mut self, mint: &str, sol_amount: f64, ts: i64) -> BuyResult {
+        let slippage_levels = [
+            self.config.slippage_bps,
+            self.config.slippage_bps + 150,
+            self.config.slippage_bps + 300,
+            self.config.slippage_bps + 500,
+        ];
+        for (i, &slippage) in slippage_levels.iter().enumerate() {
+            println!("🔄 [RETRY] BUY attempt {}/{} | mint={} | slippage={}bps", i + 1, 4, &mint[..8.min(mint.len())], slippage);
+            match self.try_buy_once(mint, sol_amount, slippage, false).await {
+                Ok(out) => return out,
+                Err(ExecOutcome::Missed { .. }) => {
+                    return ExecOutcome::Missed {
+                        reason: MissedReason::InsufficientLiquidity,
+                        stage: ExecStage::Quote,
+                        details: Some("retry exhausted".to_string()),
+                        ts,
+                    };
+                }
+                Err(ExecOutcome::Failed { .. }) => continue,
+                Err(o) => return o,
+            }
+        }
+        ExecOutcome::Missed {
+            reason: MissedReason::InsufficientLiquidity,
+            stage: ExecStage::Quote,
+            details: Some("retry exhausted".to_string()),
+            ts,
+        }
+    }
+
+    /// Un solo intento: quote -> build -> send -> confirm. En sniper: sin retry por tx too large.
+    async fn try_buy_once(
+        &mut self,
+        mint: &str,
+        sol_amount: f64,
+        slippage_bps: u16,
+        sniper_no_retry: bool,
+    ) -> Result<BuyResult, ExecOutcome> {
+        use std::result::Result as StdResult;
+        let ts = now_ts();
+        let payer = self.payer.as_ref().ok_or_else(|| ExecOutcome::Failed {
+            err: "No keypair".to_string(),
+            stage: ExecStage::Quote,
+            ts,
+        })?;
+        let jupiter = self.jupiter.as_ref().ok_or_else(|| ExecOutcome::Failed {
+            err: "Jupiter not available".to_string(),
+            stage: ExecStage::Quote,
+            ts,
+        })?;
+        let mint_pubkey: Pubkey = mint.parse().map_err(|_| ExecOutcome::Failed {
+            err: format!("Invalid mint: {}", mint),
+            stage: ExecStage::Quote,
+            ts,
+        })?;
 
         let amount_lamports = sol_to_lamports(sol_amount);
-        let mint_pubkey: Pubkey = mint.parse()
-            .map_err(|_| anyhow!("Invalid mint address: {}", mint))?;
 
-        // Validación de mint real (owner = Tokenkeg o TokenzQd)
-        if let Err(e) = self.validate_mint(&mint_pubkey).await {
-            return Err(anyhow!("Mint invalid: {}", e));
-        }
-
-        // Quote + build + send con retry si tx "too large"
-        let params_list = [
-            JupiterClient::default_quote_params(),
-            JupiterClient::fallback_quote_params(),
-        ];
-        let mut last_err = anyhow!("No attempts");
-        let mut signed_tx_opt = None;
-
-        for (i, params) in params_list.iter().enumerate() {
-            let label = if i == 0 { "default" } else { "fallback (onlyDirect)" };
-            println!("🪐 [JUPITER] Quote: {:.4} SOL -> {} (slippage={}bps) [{}]", sol_amount, &mint[..8.min(mint.len())], slippage_bps, label);
-            match jupiter.quote_and_build(
-                mints::WSOL,
-                mint,
-                amount_lamports,
-                &payer.pubkey(),
-                Some(slippage_bps),
-                Some(50_000),
-                Some(params),
-            ).await {
-                Ok(swap_result) => {
-                    if let Some(out) = swap_result.quote.out_amount() {
-                        println!("   ✓ Quote: {} lamports -> {} tokens", amount_lamports, out);
-                    }
-                    signed_tx_opt = Some(jupiter.sign_swap_tx(swap_result, payer)
-                        .map_err(|e| anyhow!("Failed to sign tx: {}", e))?);
-                    break;
-                }
-                Err(e) => {
-                    last_err = e;
-                    if i < params_list.len() - 1 {
-                        println!("   ⚡ [RETRY] Quote falló, intentando rutas más simples...");
-                    }
-                }
-            }
-        }
-
-        let signed_tx = signed_tx_opt.ok_or_else(|| last_err)?;
-        metrics.mark_build_done();
-        
-        // Send (rápido) y confirm (medible) con fallback si la tx es demasiado grande
-println!("📤 [EXEC] Sending swap transaction...");
-let sig = match self.rpc_client.send_transaction(&signed_tx).await {
-    Ok(s) => s,
-    Err(e) => {
-        let err_str = e.to_string();
-        let is_too_large = err_str.contains("too large") || err_str.contains("1688") || err_str.contains("1644") || err_str.contains("1232");
-        if is_too_large {
-            println!("   ⚡ [RETRY] Tx too large, requoting con onlyDirectRoutes...");
-            let fallback = JupiterClient::fallback_quote_params();
-            let swap_result = jupiter.quote_and_build(
-                mints::WSOL,
-                mint,
-                amount_lamports,
-                &payer.pubkey(),
-                Some(slippage_bps),
-                Some(50_000),
-                Some(&fallback),
-            ).await.map_err(|e| anyhow!("Requote failed: {}", e))?;
-            let retry_tx = jupiter.sign_swap_tx(swap_result, payer)
-                .map_err(|e| anyhow!("Failed to sign: {}", e))?;
-            self.rpc_client.send_transaction(&retry_tx).await
-                .map_err(|e| anyhow!("Send failed (after requote): {}", e))?
+        // C3: Parallel validate_mint + quote
+        let params = if sniper_no_retry {
+            JupiterClient::strict_quote_params()
         } else {
-            // Si falla, simular para obtener logs completos
-            if let Ok(sim) = self.rpc_client.simulate_transaction(&signed_tx).await {
-                if let Some(logs) = sim.value.logs {
-                    eprintln!("   [SIM_LOGS] {} mensajes:", logs.len());
-                    for (i, line) in logs.iter().enumerate() {
-                        eprintln!("      [{}] {}", i + 1, line);
+            JupiterClient::default_quote_params()
+        };
+        let validate_fut = self.validate_mint(&mint_pubkey);
+        let quote_fut = jupiter.get_quote(mints::WSOL, mint, amount_lamports, Some(slippage_bps), Some(&params));
+        let (validate_res, quote_res) = tokio::join!(validate_fut, quote_fut);
+        if let Err(e) = validate_res {
+            return Err(ExecOutcome::Missed {
+                reason: MissedReason::InsufficientLiquidity,
+                stage: ExecStage::Quote,
+                details: Some(e.to_string()),
+                ts,
+            });
+        }
+        let quote = match quote_res {
+            Ok(q) => q,
+            Err(e) => {
+                let err_str = e.to_string();
+                if sniper_no_retry && is_liquidity_or_no_route_error(&err_str) {
+                    let relaxed = JupiterClient::relaxed_quote_params();
+                    match jupiter.get_quote(mints::WSOL, mint, amount_lamports, Some(slippage_bps), Some(&relaxed)).await {
+                        Ok(q) => {
+                            if let Some(ref s) = self.stats {
+                                s.inc_fallback_quote_used();
+                            }
+                            q
+                        }
+                        Err(e2) => {
+                            let err2 = e2.to_string();
+                            println!("   ❌ [SNIPER] MISS_LIQUIDITY | strict+relaxed failed | {}", err2);
+                            return Err(ExecOutcome::Missed {
+                                reason: MissedReason::InsufficientLiquidity,
+                                stage: ExecStage::Quote,
+                                details: Some(format!("strict: {}; relaxed: {}", err_str, err2)),
+                                ts,
+                            });
+                        }
                     }
+                } else {
+                    let reason = map_quote_error_to_missed(&err_str);
+                    println!("   ❌ [SNIPER] MISS {:?} | stage=Quote | {}", reason, err_str);
+                    return Err(ExecOutcome::Missed {
+                        reason,
+                        stage: ExecStage::Quote,
+                        details: Some(err_str),
+                        ts,
+                    });
                 }
             }
-            return Err(anyhow!("Send failed: {}", e));
-        }
-    }
-};
-
-metrics.mark_send_done();
-
-        let timeout_secs = self.config.execution_config.confirm_timeout_secs;
-        println!("⏳ [EXEC] Esperando confirmación on-chain ({}s)...", timeout_secs);
-        match self.broadcaster.confirm_transaction(&sig).await {
-            Ok(true) => {}
-            Ok(false) => {
-                println!("⚠️ [EXEC] Tx no confirmada en timeout - pasar a reconciliación | sig={}", sig);
-                metrics.mark_confirm_done();
-                let m = metrics.finalize(false, Some("confirm_timeout".to_string()));
-                m.log("BUY", mint);
-                return Ok(BuyExecutionResult {
-                    my_sig: sig.to_string(),
-                    my_token_balance: 0,
-                    my_sol_spent: sol_amount,
-                    status: ExecuteStatus::UnknownTimeout,
+        };
+        let swap_result = match jupiter.build_swap_tx(&quote, &payer.pubkey(), Some(50_000)).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(ExecOutcome::Failed {
+                    err: format!("Build swap failed: {}", e),
+                    stage: ExecStage::Build,
+                    ts,
                 });
             }
-            Err(e) => return Err(anyhow!("Confirm failed: {} (sig={})", e, sig)),
         };
-        metrics.mark_confirm_done();
 
-// CRITICAL: Verificar tokens recibidos
-        // 1) Primero por postTokenBalances de la tx (ultra robusto, no depende del indexado)
-        println!("⏳ [EXEC] Verificando balance...");
-        sleep(Duration::from_millis(300)).await;
+        let out_amount = swap_result.quote.out_amount().unwrap_or(0);
+        let price_impact_bps = swap_result.quote.price_impact_pct().map(|p| (p * 100.0) as u32);
 
-        let token_balance = match self.verify_tokens_from_tx_with_retry(&sig, &payer.pubkey(), mint, 8).await? {
-            Some(amt) => {
-                if amt > 0 {
-                    println!("   ✓ [TX] postTokenBalances confirma {} tokens", amt);
-                    amt
-                } else {
-                    // confirm_ms ya mide confirmación on-chain
-            // (skip mark_confirm_done)
-            
-                    let m = metrics.finalize(false, Some("No tokens in postTokenBalances".to_string()));
-                    m.log("BUY", mint);
-                    return Err(anyhow!("BUY tx confirmada pero postTokenBalances=0 (sig={})", sig));
+        let signed_tx = match jupiter.sign_swap_tx(swap_result, payer) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return Err(ExecOutcome::Failed {
+                    err: format!("Sign failed: {}", e),
+                    stage: ExecStage::Build,
+                    ts,
+                });
+            }
+        };
+
+        // Send: skip_preflight para velocidad (C4)
+        let send_config = RpcSendTransactionConfig {
+            skip_preflight: self.config.execution_config.preflight_mode == crate::execution_config::PreflightMode::SkipPreflight,
+            ..Default::default()
+        };
+        let sig = match self.rpc_client.send_transaction_with_config(&signed_tx, send_config).await {
+            Ok(s) => s,
+            Err(e) => {
+                let err_str = e.to_string();
+                let is_too_large = err_str.contains("too large") || err_str.contains("1688") || err_str.contains("1644");
+                if is_too_large && !sniper_no_retry {
+                    if let Ok(fallback) = jupiter.quote_and_build(mints::WSOL, mint, amount_lamports, &payer.pubkey(), Some(slippage_bps), Some(50_000), Some(&JupiterClient::fallback_quote_params())).await {
+                        if let Ok(tx2) = jupiter.sign_swap_tx(fallback, payer) {
+                            if let Ok(s2) = self.rpc_client.send_transaction(&tx2).await {
+                                return Ok(self.confirm_and_verify_buy(&s2, mint, sol_amount, out_amount, price_impact_bps, payer, &mint_pubkey).await);
+                            }
+                        }
+                    }
                 }
+                return Err(if classify_error(&err_str) == ErrorCategory::Miss {
+                    ExecOutcome::Missed {
+                        reason: map_quote_error_to_missed(&err_str),
+                        stage: ExecStage::Send,
+                        details: Some(err_str),
+                        ts,
+                    }
+                } else {
+                    ExecOutcome::Failed {
+                        err: err_str,
+                        stage: ExecStage::Send,
+                        ts,
+                    }
+                });
             }
-            None => {
-                // 2) Fallback: ATA con retry (tx puede tardar en indexarse)
-                println!("   [EXEC] postTokenBalances no disponible, usando get_token_balance...");
-                self.get_token_balance_with_retry(&payer.pubkey(), &mint_pubkey, 8).await?
+        };
+
+        Ok(self.confirm_and_verify_buy(&sig, mint, sol_amount, out_amount, price_impact_bps, payer, &mint_pubkey).await)
+    }
+
+    async fn confirm_and_verify_buy(
+        &self,
+        sig: &solana_sdk::signature::Signature,
+        mint: &str,
+        sol_amount: f64,
+        expected_out: u64,
+        price_impact_bps: Option<u32>,
+        payer: &Keypair,
+        mint_pubkey: &Pubkey,
+    ) -> BuyResult {
+        let ts = now_ts();
+        let timeout = self.config.execution_config.confirm_timeout_secs;
+        match self.broadcaster.confirm_transaction(sig).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return ExecOutcome::Failed {
+                    err: format!("Confirm timeout (sig={})", sig),
+                    stage: ExecStage::Confirm,
+                    ts,
+                };
             }
+            Err(e) => {
+                return ExecOutcome::Failed {
+                    err: format!("Confirm failed: {} (sig={})", e, sig),
+                    stage: ExecStage::Confirm,
+                    ts,
+                };
+            }
+        }
+
+        sleep(Duration::from_millis(200)).await;
+        let token_balance = match self.verify_tokens_from_tx_with_retry(sig, &payer.pubkey(), mint, 6).await {
+            Ok(Some(b)) if b > 0 => b,
+            Ok(_) => self.get_token_balance_with_retry(&payer.pubkey(), mint_pubkey, 6).await.unwrap_or(0),
+            Err(_) => 0,
         };
 
         if token_balance == 0 {
-            // Log diagnóstico para distinguir index delay vs swap fallido vs mint raro
-            if let Ok(token_program) = self.get_mint_token_program_id(&mint_pubkey).await {
-                let ata = get_associated_token_address_with_program_id(&payer.pubkey(), &mint_pubkey, &token_program);
-                eprintln!("   [DIAG] balance=0 | mint={} | token_program={} | ata={}", 
-                    &mint[..8.min(mint.len())], token_program, ata);
-            }
-            // confirm_ms ya mide confirmación on-chain
-            // (skip mark_confirm_done)
-            
-            let m = metrics.finalize(false, Some("No tokens received".to_string()));
-            m.log("BUY", mint);
-            return Err(anyhow!("BUY tx confirmed but no tokens received (sig={})", sig));
+            return ExecOutcome::Failed {
+                err: format!("No tokens received (sig={})", sig),
+                stage: ExecStage::Confirm,
+                ts,
+            };
         }
 
-        // confirm_ms ya mide confirmación on-chain
-            // (skip mark_confirm_done)
-            
-        
-        println!("✅ [EXEC] BUY VERIFIED | sig={} | balance={} tokens", sig, token_balance);
-        let m = metrics.finalize(true, None);
-        m.log("BUY (jupiter)", mint);
-        
-        Ok(BuyExecutionResult {
-            my_sig: sig.to_string(),
-            my_token_balance: token_balance,
-            my_sol_spent: sol_amount,
-            status: ExecuteStatus::Confirmed,
-        })
+        println!("✅ [SNIPER] FILLED | sig={} | balance={} tokens", sig, token_balance);
+        if let Some(ref s) = self.stats {
+            s.inc_executed_buys();
+        }
+        ExecOutcome::Filled {
+            sig: sig.to_string(),
+            in_amount_sol: sol_amount,
+            out_amount: token_balance,
+            price_impact_bps,
+            ts,
+        }
     }
 
     /// Ejecuta SELL con retry por slippage (0x1771) igual que BUY

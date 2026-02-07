@@ -233,7 +233,25 @@ impl JupiterClient {
         }
     }
 
-    /// Params para retry cuando tx es "too large"
+    /// SNIPER Strict (FAST): rutas simples y rápidas
+    pub fn strict_quote_params() -> QuoteParams {
+        QuoteParams {
+            only_direct_routes: false,
+            max_accounts: Some(16),
+            restrict_intermediate_tokens: true,
+        }
+    }
+
+    /// SNIPER Relaxed (FALLBACK): más rutas permitidas cuando strict falla con NO_ROUTE
+    pub fn relaxed_quote_params() -> QuoteParams {
+        QuoteParams {
+            only_direct_routes: false,
+            max_accounts: Some(32),
+            restrict_intermediate_tokens: false,
+        }
+    }
+
+    /// Params para retry cuando tx es "too large" (legacy SELL path)
     pub fn fallback_quote_params() -> QuoteParams {
         QuoteParams {
             only_direct_routes: true,
